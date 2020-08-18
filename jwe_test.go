@@ -21,7 +21,9 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/x509"
 	"math/big"
+	"regexp"
 	"testing"
 )
 
@@ -120,28 +122,47 @@ func TestFullParseJWE(t *testing.T) {
 }
 
 func TestMissingInvalidHeaders(t *testing.T) {
-	obj := &JsonWebEncryption{
-		protected:   &rawHeader{Enc: A128GCM},
+	protected := &rawHeader{}
+
+	err := protected.set(headerEncryption, A128GCM)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	obj := &JSONWebEncryption{
+		protected:   protected,
 		unprotected: &rawHeader{},
 		recipients: []recipientInfo{
-			recipientInfo{},
+			{},
 		},
 	}
 
-	_, err := obj.Decrypt(nil)
+	_, err = obj.Decrypt(nil)
 	if err != ErrUnsupportedKeyType {
 		t.Error("should detect invalid key")
 	}
 
-	obj.unprotected.Crit = []string{"1", "2"}
+	err = obj.unprotected.set(headerCritical, []string{"1", "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = obj.Decrypt(nil)
 	if err == nil {
 		t.Error("should reject message with crit header")
 	}
 
-	obj.unprotected.Crit = nil
-	obj.protected = &rawHeader{Alg: string(RSA1_5)}
+	err = obj.unprotected.set(headerCritical, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	obj.protected = &rawHeader{}
+
+	err = obj.protected.set(headerAlgorithm, RSA1_5)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	_, err = obj.Decrypt(rsaTestKey)
 	if err == nil || err == ErrCryptoFailure {
@@ -211,11 +232,16 @@ func TestRejectUnprotectedJWENonce(t *testing.T) {
 
 func TestCompactSerialize(t *testing.T) {
 	// Compact serialization must fail if we have unprotected headers
-	obj := &JsonWebEncryption{
-		unprotected: &rawHeader{Alg: "XYZ"},
+	obj := &JSONWebEncryption{
+		unprotected: &rawHeader{},
 	}
 
-	_, err := obj.CompactSerialize()
+	err := obj.unprotected.set(headerAlgorithm, "XYZ")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = obj.CompactSerialize()
 	if err == nil {
 		t.Error("Object with unprotected headers can't be compact serialized")
 	}
@@ -263,7 +289,7 @@ func TestVectorsJWE(t *testing.T) {
 		"tag":"XFBoMYUZodetZdvTiFvSkQ" }`)
 
 	// Mock random reader
-	randReader = bytes.NewReader([]byte{
+	RandReader = bytes.NewReader([]byte{
 		// Encryption key
 		177, 161, 244, 128, 84, 143, 225, 115, 63, 180, 3, 255, 107, 154,
 		212, 246, 138, 7, 110, 91, 112, 46, 34, 105, 47, 130, 203, 46, 122,
@@ -275,24 +301,36 @@ func TestVectorsJWE(t *testing.T) {
 	defer resetRandReader()
 
 	// Encrypt with a dummy key
-	encrypter, err := NewEncrypter(RSA_OAEP, A256GCM, publicKey)
+	encrypter, err := NewEncrypter(A256GCM, Recipient{Algorithm: RSA_OAEP, Key: publicKey}, nil)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
 	object, err := encrypter.Encrypt(plaintext)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
 	serialized, err := object.CompactSerialize()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if serialized != expectedCompact {
 		t.Error("Compact serialization is not what we expected", serialized, expectedCompact)
 	}
 
 	serialized = object.FullSerialize()
 	if serialized != expectedFull {
-		t.Error("Full serialization is not what we expected")
+		t.Error("JSON serialization is not what we expected")
+	}
+}
+
+func TestJWENilProtected(t *testing.T) {
+	key := []byte("1234567890123456")
+	serialized := `{"unprotected":{"alg":"dir","enc":"A128GCM"}}`
+	jwe, _ := ParseEncrypted(serialized)
+	if _, err := jwe.Decrypt(key); err == nil {
+		t.Error(err)
 	}
 }
 
@@ -354,7 +392,7 @@ func TestVectorsJWECorrupt(t *testing.T) {
 
 // Test vectors generated with nimbus-jose-jwt
 func TestSampleNimbusJWEMessagesRSA(t *testing.T) {
-	rsaPrivateKey, err := LoadPrivateKey(fromBase64Bytes(`
+	rsaPrivateKey, err := x509.ParsePKCS8PrivateKey(fromBase64Bytes(`
 		MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQCNRCEmf5PlbXKuT4uwnb
 		wGKvFrtpi+bDYxOZxxqxdVkZM/bYATAnD1fg9pNvLMKeF+MWJ9kPIMmDgOh9RdnRdLvQGb
 		BzhLmxwhhcua2QYiHEZizXmiaXvNP12bzEBhebdX7ObW8izMVW0p0lqHPNzkK3K75B0Sxo
@@ -430,7 +468,7 @@ func TestSampleNimbusJWEMessagesAESKW(t *testing.T) {
 	}
 
 	aesSampleMessages := [][]string{
-		[]string{
+		{
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTI4R0NNIiwidGFnIjoib2ZMd2Q5NGloVWFRckJ0T1pQUDdjUSIsImFsZyI6IkExMjhHQ01LVyIsIml2IjoiV2Z3TnN5cjEwWUFjY2p2diJ9.9x3RxdqIS6P9xjh93Eu1bQ.6fs3_fSGt2jull_5.YDlzr6sWACkFg_GU5MEc-ZEWxNLwI_JMKe_jFA.f-pq-V7rlSSg_q2e1gDygw",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTkyR0NNIiwidGFnIjoic2RneXB1ckFjTEFzTmZJU0lkZUNpUSIsImFsZyI6IkExMjhHQ01LVyIsIml2IjoieVFMR0dCdDJFZ0c1THdyViJ9.arslKo4aKlh6f4s0z1_-U-8JbmhAoZHN.Xw2Q-GX98YXwuc4i.halTEWMWAYZbv-qOD52G6bte4x6sxlh1_VpGEA.Z1spn016v58cW6Q2o0Qxag",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMjU2R0NNIiwidGFnIjoicTNzejF5VUlhbVBDYXJfZ05kSVJqQSIsImFsZyI6IkExMjhHQ01LVyIsIml2IjoiM0ZRM0FsLWJWdWhmcEIyQyJ9.dhVipWbzIdsINttuZM4hnjpHvwEHf0VsVrOp4GAg01g.dk7dUyt1Qj13Pipw.5Tt70ONATF0BZAS8dBkYmCV7AQUrfb8qmKNLmw.A6ton9MQjZg0b3C0QcW-hg",
@@ -444,7 +482,7 @@ func TestSampleNimbusJWEMessagesAESKW(t *testing.T) {
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTkyQ0JDLUhTMzg0IiwiYWxnIjoiQTEyOEtXIn0.szGrdnmF7D5put2aRBvSSFfp0vRgkRGYaafijJIqAF6PWd1IxsysZRV8aQkQOW1cB6d0fXsTfYM.Ru25LVOOk4xhaK-cIZ0ThA.pF9Ok5zot7elVqXFW5YYHV8MuF9gVGzpQnG1XDs_g_w.-7la0uwcNPpteev185pMHZjbVDXlrec8",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwiYWxnIjoiQTEyOEtXIn0.cz-hRv0xR5CnOcnoRWNK8Q9poyVYzRCVTjfmEXQN6xPOZUkJ3zKNqb8Pir_FS0o2TVvxmIbuxeISeATTR2Ttx_YGCNgMkc93.SF5rEQT94lZR-UORcMKqGw.xphygoU7zE0ZggOczXCi_ytt-Evln8CL-7WLDlWcUHg.5h99r8xCCwP2PgDbZqzCJ13oFfB2vZWetD5qZjmmVho",
 		},
-		[]string{
+		{
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTI4R0NNIiwidGFnIjoiVWR5WUVKdEJ5ZTA5dzdjclY0cXI1QSIsImFsZyI6IkExOTJHQ01LVyIsIml2IjoiZlBBV0QwUmdSbHlFdktQcCJ9.P1uTfTuH-imL-NJJMpuTRA.22yqZ1NIfx3KNPgc.hORWZaTSgni1FS-JT90vJly-cU37qTn-tWSqTg.gMN0ufXF92rSXupTtBNkhA",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTkyR0NNIiwidGFnIjoiOU9qX3B2LTJSNW5lZl9YbWVkUWltUSIsImFsZyI6IkExOTJHQ01LVyIsIml2IjoiY3BybGEwYUYzREVQNmFJTSJ9.6NVpAm_APiC7km2v-oNR8g23K9U_kf1-.jIg-p8tNwSvwxch0.1i-GPaxS4qR6Gy4tzeVtSdRFRSKQSMpmn-VhzA.qhFWPqtA6vVPl7OM3DThsA",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMjU2R0NNIiwidGFnIjoiOVc3THg3MVhGQVJCb3NaLVZ5dXc4ZyIsImFsZyI6IkExOTJHQ01LVyIsIml2IjoiZ1N4ZE5heFdBSVBRR0tHYiJ9.3YjPz6dVQwAtCekvtXiHZrooOUlmCsMSvyfwmGwdrOA.hA_C0IDJmGaRzsB0.W4l7OPqpFxiVOZTGfAlRktquyRTo4cEOk9KurQ.l4bGxOkO_ql_jlPo3Oz3TQ",
@@ -458,7 +496,7 @@ func TestSampleNimbusJWEMessagesAESKW(t *testing.T) {
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTkyQ0JDLUhTMzg0IiwiYWxnIjoiQTE5MktXIn0.T2EfQ6Tu2wJyRMgZzfvBYmQNCCfdMudMrg86ibEMVAOUKJPtR3WMPEb_Syy9p2VjrLKRlv7nebo.GPc8VbarPPRtzIRATB8NsA.ugPCqLvVLwh55bWlwjsFkmWzJ31z5z-wuih2oJqmG_U.m7FY3EjvV6mKosEYJ5cY7ezFoVQoJS8X",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwiYWxnIjoiQTE5MktXIn0.OgLMhZ-2ZhslQyHfzOfyC-qmT6bNg9AdpP59B4jtyxWkQu3eW475WCdiAjojjeyBtVRGQ5vOomwaOIFejY_IekzH6I_taii3.U9x44MF6Wyz5TIwIzwhoxQ.vK7yvSF2beKdNxNY_7n4XdF7JluCGZoxdFJyTJVkSmI.bXRlI8KL-g7gpprQxGmXjVYjYghhWJq7mlCfWI8q2uA",
 		},
-		[]string{
+		{
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTI4R0NNIiwidGFnIjoiR3BjX3pfbjduZjJVZlEtWGdsaTBaQSIsImFsZyI6IkEyNTZHQ01LVyIsIml2IjoiUk40eUdhOVlvYlFhUmZ1TCJ9.Q4ukD6_hZpmASAVcqWJ9Wg.Zfhny_1WNdlp4fH-.3sekDCjkExQCcv28ZW4yrcFnz0vma3vgoenSXA.g8_Ird2Y0itTCDP61du-Yg",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMTkyR0NNIiwidGFnIjoiWC05UkNVWVh4U3NRelcwelVJS01VUSIsImFsZyI6IkEyNTZHQ01LVyIsIml2IjoiY3JNMnJfa3RrdWpyQ1h5OSJ9.c0q2jCxxV4y1h9u_Xvn7FqUDnbkmNEG4.S_noOTZKuUo9z1l6.ez0RdA25vXMUGH96iXmj3DEVox0J7TasJMnzgg.RbuSPTte_NzTtEEokbc5Ig",
 			"eyJ6aXAiOiJERUYiLCJlbmMiOiJBMjU2R0NNIiwidGFnIjoiWmwyaDFpUW11QWZWd2lJeVp5RHloZyIsImFsZyI6IkEyNTZHQ01LVyIsIml2Ijoib19xZmljb0N0NzNzRWo1QyJ9.NpJxRJ0aqcpekD6HU2u9e6_pL_11JXjWvjfeQnAKkZU.4c5qBcBBrMWi27Lf.NKwNIb4b6cRDJ1TwMKsPrjs7ADn6aNoBdQClVw.yNWmSSRBqQfIQObzj8zDqw",
@@ -533,5 +571,110 @@ func TestSampleJose4jJWEMessagesECDH(t *testing.T) {
 		if string(plaintext) != "Lorem ipsum dolor sit amet." {
 			t.Error("plaintext is not what we expected for msg", msg)
 		}
+	}
+}
+
+func TestPrecomputedECDHMessagesFromJose4j(t *testing.T) {
+	data := []struct{ key, message string }{
+		{
+			`{"kty":"EC","x":"fXx-DfOsmecjKh3VrLZFsF98Z1nutsL4UdFTdgA8S7Y","y":"LGzyJY99aqKk52UIExcNFSTs0S7HnNzQ-DRWBTHDad4","crv":"P-256","d":"OeVCWbXuFuJ9U16q7bhLNoKPLLnK-yTx95grzfvQ2l4"}`,
+			`eyJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwiYWxnIjoiRUNESC1FUyIsImVwayI6eyJrdHkiOiJFQyIsIngiOiJ3ZlRHNVFHZkItNHUxanVUUEN1aTNESXhFTV82ZUs5ZEk5TXNZckpxWDRnIiwieSI6Ik8yanlRbHQ2TXFGTGtqMWFCWW1aNXZJWHFVRHh6Ulk3dER0WmdZUUVNa0kiLCJjcnYiOiJQLTI1NiJ9fQ..mk4wQzGSSeZ8uSgEYTIetA.fCw3-TosL4p0D5fEXw0bEA.9mPsdmGTVoVexXqEOdN5VUKk-ZNtfOtUfbdjVHoko_o`,
+		},
+		{
+			`{"kty":"EC","x":"nBr92fh2JsEjIF1LR5PKICBeHNIBe0xb7nlBrrU3WoWgfJYfXve1jxC-5VT5EPLt","y":"sUAxL3L5lJdzFUSR9EHLniuBhEbvXfPa_3OiR6Du0_GOlFXXIi4UmbNpk10_Thfq","crv":"P-384","d":"0f0NnWg__Qgqjj3fl2gAlsID4Ni41FR88cmZPVgb6ch-ZShuVJRjoxymCuzVP7Gi"}`,
+			`eyJlbmMiOiJBMTkyQ0JDLUhTMzg0IiwiYWxnIjoiRUNESC1FUyIsImVwayI6eyJrdHkiOiJFQyIsIngiOiJsX3hXdzIyb1NfOWZGbV96amNzYkstd3R3d0RHSlRQLUxnNFVBWDI3WWF1b1YwNml2emwtcm1ra2h6ci11SDBmIiwieSI6IloyYmVnbzBqeE9nY0YtNVp4SFNBOU5jZDVCOW8wUE1pSVlRbm9sWkNQTHA3YndPd1RLUEZaaFZVUlFPSjdoeUciLCJjcnYiOiJQLTM4NCJ9fQ..jSWP7pfa4KcpqKWZ1x8awg.osb-5641Ej1Uon_f3U8bNw.KUQWwb35Gxq3YQ34_AVkebugx4rxq1lO`,
+		},
+		{
+			`{"kty":"EC","x":"AH3rqSYjKue50ThW0qq_qQ76cNtqWrc7hU6kZR6akxy8iTf8ugcpqnbgbi98AgSwIqgJZDBMCk-8eoiGaf3R_kDD","y":"AeafPdJjHLf6pK5V7iyMsL3-6MShpHS6jXQ8m-Bcbp06yxAMn6TJbdkacvj45dy_pdh1s6XZwoxRxNETg_gj-hq9","crv":"P-521","d":"AB2tm9vgGe2BaxZmJQ016GY-U7NV_EWhrPsLDC5l9tAM9DGEwI2cT2HcO20Z6CQndw0ZhqLZ6MEvS8siL-SCxIl2"}`,
+			`eyJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwiYWxnIjoiRUNESC1FUyIsImVwayI6eyJrdHkiOiJFQyIsIngiOiJBQ1RLMlVPSjJ6SVk3U1U4T0xkaG1QQmE4ZUVpd2JrX09UMXE0MHBsRlRwQmJKUXg3YWdqWG9LYml2NS1OTXB6eXZySm1rblM3SjNRUWlUeFgwWmtjemhEIiwieSI6IkFXeTZCR1dkZld2ekVNeGIxQklCQnZmRDJ4bEh6Rjk2YzVVRVQ4SFBUS0RSeUJyMnQ4T2dTX1J2MnNoUmxGbXlqUWpyX25uQk94akcxVTZNWDNlZ2VETzciLCJjcnYiOiJQLTUyMSJ9fQ..EWqSGntxbO_Y_6JRjFkCgg.DGjDNjAYdsnYTpUFJi1gEI4YtNd7gBPMjD3CDH047RAwZKTme6Ah_ztzxSfVg5kG.yGm5jn2LtbFXaK_yf0b0932sI2O77j2gwmL1Y09YC_Y`,
+		},
+	}
+
+	for i, vector := range data {
+		var jwk JSONWebKey
+		err := jwk.UnmarshalJSON([]byte(vector.key))
+		if err != nil {
+			t.Fatal(i, err)
+		}
+
+		parsed, err := ParseEncrypted(vector.message)
+		if err != nil {
+			t.Fatal(i, err)
+		}
+
+		_, err = parsed.Decrypt(jwk)
+		if err != nil {
+			t.Fatal(i, err)
+		}
+	}
+}
+
+func TestSampleAESCBCHMACMessagesFromNodeJose(t *testing.T) {
+	samples := []struct {
+		key        []byte
+		ciphertext string
+	}{
+		// A256CBC
+		{
+			fromBase64URLBytes("5SeJepAQ8Hmza4bM_wAQjvW0cFbPo_0TBc-sPblNBKs5SeJepAQ8Hmza4bM_wAQjvW0cFbPo_0TBc-sPblNBKs"),
+			`{"protected":"eyJjdHkiOiJKV1QiLCJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTNTEyIiwia2lkIjoidGVzdDUxMiJ9","iv":"9Gloee8teNSSjXG_ifPRnA","ciphertext":"x12B46biQ6axL4ee5mHwpA","tag":"ec7qQ4c8Gyx57BelJoULIW6GRW7Bccm44d0iEfU4yIw"}`,
+		},
+		// A192CBC
+		{
+			fromBase64URLBytes("b0ha2QPh_1D-wxtRK3jzzg7MEuD1g91zb0ha2QPh_1D-wxtRK3jzzg7MEuD1g91z"),
+			`{"protected":"eyJjdHkiOiJKV1QiLCJhbGciOiJkaXIiLCJlbmMiOiJBMTkyQ0JDLUhTMzg0Iiwia2lkIjoidGVzdDM4NCJ9","iv":"zocDwPrIX4PZ7ObdoP3m7A","ciphertext":"kLTpZfiX7Qv3r2TaZzUCFg","tag":"Hxk9xu72WHBos5JWpShFmasiNbVqBQqi"}`,
+		},
+		// A128CBC
+		{
+			fromBase64URLBytes("5SeJepAQ8Hmza4bM_wAQjvW0cFbPo_0TBc-sPblNBKs"),
+			`{"protected":"eyJjdHkiOiJKV1QiLCJhbGciOiJkaXIiLCJlbmMiOiJBMTI4Q0JDLUhTMjU2Iiwia2lkIjoidGVzdDI1NiJ9","iv":"oDjxSLU4joRZR9YybE83RQ","ciphertext":"y93rgZp209nvmbX8hvN0Zg","tag":"NrivXSKPqzkmcpQTThXpzQ"}`,
+		},
+	}
+
+	for _, sample := range samples {
+		obj, err := ParseEncrypted(sample.ciphertext)
+		if err != nil {
+			t.Error("unable to parse message", sample.ciphertext, err)
+			continue
+		}
+		plaintext, err := obj.Decrypt(sample.key)
+		if err != nil {
+			t.Error("unable to decrypt message", sample.ciphertext, err)
+			continue
+		}
+		if string(plaintext) != "Hello World" {
+			t.Error("plaintext is not what we expected for msg", sample.ciphertext, string(plaintext))
+		}
+	}
+}
+
+func TestTamperedJWE(t *testing.T) {
+	key := []byte("1234567890123456")
+
+	encrypter, _ := NewEncrypter(A128GCM,
+		Recipient{Algorithm: DIRECT, Key: key}, nil)
+
+	var plaintext = []byte("Lorem ipsum dolor sit amet")
+	object, _ := encrypter.Encrypt(plaintext)
+
+	serialized := object.FullSerialize()
+
+	// Inject a longer iv
+	serialized = regexp.MustCompile(`"iv":"[^"]+"`).
+		ReplaceAllString(serialized, `"iv":"UotNnfiavtNOOSZAcfI03i"`)
+
+	object, _ = ParseEncrypted(serialized)
+
+	_, err := object.Decrypt(key)
+	if err == nil {
+		t.Error("Decrypt() on invalid object should fail")
+	}
+}
+
+func TestJWEWithNullAlg(t *testing.T) {
+	// {"alg":null,"enc":"A128GCM"}
+	serialized := `{"protected":"eyJhbGciOm51bGwsImVuYyI6IkExMjhHQ00ifQ"}`
+	if _, err := ParseEncrypted(serialized); err == nil {
+		t.Error(err)
 	}
 }

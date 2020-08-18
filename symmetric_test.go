@@ -20,8 +20,11 @@ import (
 	"bytes"
 	"crypto/cipher"
 	"crypto/rand"
+	"crypto/sha256"
 	"io"
 	"testing"
+
+	"golang.org/x/crypto/pbkdf2"
 )
 
 func TestInvalidSymmetricAlgorithms(t *testing.T) {
@@ -67,7 +70,9 @@ func TestInvalidKey(t *testing.T) {
 
 func TestStaticKeyGen(t *testing.T) {
 	key := make([]byte, 32)
-	io.ReadFull(rand.Reader, key)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		t.Fatal(err)
+	}
 
 	gen := &staticKeyGenerator{key: key}
 	if gen.keySize() != len(key) {
@@ -80,6 +85,21 @@ func TestStaticKeyGen(t *testing.T) {
 	}
 	if !bytes.Equal(generated, key) {
 		t.Error("static key generator returns different data")
+	}
+}
+
+func TestAeadInvalidInput(t *testing.T) {
+	sample := []byte("1234567890123456")
+	tt := []aeadParts{
+		{},
+		{iv: sample, tag: sample},
+	}
+	for _, tc := range tt {
+		aead := newAESGCM(16).(*aeadContentCipher)
+		_, err := aead.decrypt(sample, []byte{}, &tc)
+		if err != ErrCryptoFailure {
+			t.Error("should handle aead failure")
+		}
 	}
 }
 
@@ -108,7 +128,7 @@ func TestVectorsAESGCM(t *testing.T) {
 		92, 80, 104, 49, 133, 25, 161, 215, 173, 101, 219, 211, 136, 91, 210, 145}
 
 	// Mock random reader
-	randReader = bytes.NewReader([]byte{
+	RandReader = bytes.NewReader([]byte{
 		177, 161, 244, 128, 84, 143, 225, 115, 63, 180, 3, 255, 107, 154,
 		212, 246, 138, 7, 110, 91, 112, 46, 34, 105, 47, 130, 203, 46, 122,
 		234, 64, 252, 227, 197, 117, 252, 2, 219, 233, 68, 180, 225, 77, 219})
@@ -122,10 +142,57 @@ func TestVectorsAESGCM(t *testing.T) {
 		return
 	}
 
-	if bytes.Compare(out.ciphertext, expectedCiphertext) != 0 {
+	if !bytes.Equal(out.ciphertext, expectedCiphertext) {
 		t.Error("Ciphertext did not match")
 	}
-	if bytes.Compare(out.tag, expectedAuthtag) != 0 {
+	if !bytes.Equal(out.tag, expectedAuthtag) {
 		t.Error("Auth tag did not match")
+	}
+}
+
+func TestVectorPBES2_HS256A_128KW(t *testing.T) {
+	cipher := &symmetricKeyCipher{
+		key: []byte("Thus from my lips, by yours, my sin is purged."),
+		p2c: 4096,
+		p2s: []byte{
+			217, 96, 147, 112, 150, 117, 70,
+			247, 127, 8, 155, 137, 174, 42, 80, 215,
+		},
+	}
+
+	cek := []byte{
+		111, 27, 25, 52, 66, 29, 20, 78, 92, 176, 56, 240, 65, 208, 82, 112,
+		161, 131, 36, 55, 202, 236, 185, 172, 129, 23, 153, 194, 195, 48,
+		253, 182,
+	}
+
+	// PBES2-HS256+A128KW || 0x00 || p2s
+	salt := []byte{
+		80, 66, 69, 83, 50, 45, 72, 83, 50, 53, 54, 43, 65, 49, 50, 56, 75,
+		87, 0, 217, 96, 147, 112, 150, 117, 70, 247, 127, 8, 155, 137, 174,
+		42, 80, 215,
+	}
+
+	expectedDerivedKey := []byte{
+		110, 171, 169, 92, 129, 92, 109, 117, 233, 242, 116, 233, 170, 14,
+		24, 75}
+
+	expectedEncryptedKey := []byte{
+		78, 186, 151, 59, 11, 141, 81, 240, 213, 245, 83, 211, 53, 188, 134,
+		188, 66, 125, 36, 200, 222, 124, 5, 103, 249, 52, 117, 184, 140, 81,
+		246, 158, 161, 177, 20, 33, 245, 57, 59, 4}
+
+	derivedKey := pbkdf2.Key(cipher.key, salt, cipher.p2c, 16, sha256.New)
+	if !bytes.Equal(derivedKey, expectedDerivedKey) {
+		t.Error("Derived key did not match")
+	}
+
+	encryptedKey, err := cipher.encryptKey(cek, PBES2_HS256_A128KW)
+	if err != nil {
+		t.Fatal("Unable to encrypt:", err)
+	}
+
+	if !bytes.Equal(encryptedKey.encryptedKey, expectedEncryptedKey) {
+		t.Error("Encrypted key did not match")
 	}
 }

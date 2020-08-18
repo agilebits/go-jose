@@ -1,5 +1,5 @@
 /*-
- * Copyright 2014 Square Inc.
+ * Copyright 2019 Square Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,32 @@
  * limitations under the License.
  */
 
-package jose
+package generator
 
 import (
 	"crypto/x509"
 	"encoding/pem"
-	"fmt"
+	"errors"
+
+	jose "github.com/square/go-jose/v3"
 )
 
-// LoadPublicKey loads a public key from PEM/DER-encoded data.
+func LoadJSONWebKey(json []byte, pub bool) (*jose.JSONWebKey, error) {
+	var jwk jose.JSONWebKey
+	err := jwk.UnmarshalJSON(json)
+	if err != nil {
+		return nil, err
+	}
+	if !jwk.Valid() {
+		return nil, errors.New("invalid JWK key")
+	}
+	if jwk.IsPublic() != pub {
+		return nil, errors.New("priv/pub JWK key mismatch")
+	}
+	return &jwk, nil
+}
+
+// LoadPublicKey loads a public key from PEM/DER/JWK-encoded data.
 func LoadPublicKey(data []byte) (interface{}, error) {
 	input := data
 
@@ -42,10 +59,15 @@ func LoadPublicKey(data []byte) (interface{}, error) {
 		return cert.PublicKey, nil
 	}
 
-	return nil, fmt.Errorf("square/go-jose: parse error, got '%s' and '%s'", err0, err1)
+	jwk, err2 := LoadJSONWebKey(data, true)
+	if err2 == nil {
+		return jwk, nil
+	}
+
+	return nil, errors.New("parse error, invalid public key")
 }
 
-// LoadPrivateKey loads a private key from PEM/DER-encoded data.
+// LoadPrivateKey loads a private key from PEM/DER/JWK-encoded data.
 func LoadPrivateKey(data []byte) (interface{}, error) {
 	input := data
 
@@ -70,5 +92,10 @@ func LoadPrivateKey(data []byte) (interface{}, error) {
 		return priv, nil
 	}
 
-	return nil, fmt.Errorf("square/go-jose: parse error, got '%s', '%s' and '%s'", err0, err1, err2)
+	jwk, err3 := LoadJSONWebKey(input, false)
+	if err3 == nil {
+		return jwk, nil
+	}
+
+	return nil, errors.New("parse error, invalid private key")
 }

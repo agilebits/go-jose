@@ -19,11 +19,15 @@ package jose
 import (
 	"bytes"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"fmt"
 	"io"
+	"math/big"
+	"reflect"
+	"regexp"
 	"testing"
 )
 
@@ -34,13 +38,21 @@ var ecTestKey256, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 var ecTestKey384, _ = ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
 var ecTestKey521, _ = ecdsa.GenerateKey(elliptic.P521(), rand.Reader)
 
-func RoundtripJWE(keyAlg KeyAlgorithm, encAlg ContentEncryption, compressionAlg CompressionAlgorithm, serializer func(*JsonWebEncryption) (string, error), corrupter func(*JsonWebEncryption) bool, aad []byte, encryptionKey interface{}, decryptionKey interface{}) error {
-	enc, err := NewEncrypter(keyAlg, encAlg, encryptionKey)
+var ed25519PublicKey, ed25519PrivateKey, _ = ed25519.GenerateKey(rand.Reader)
+
+func RoundtripJWE(keyAlg KeyAlgorithm, encAlg ContentEncryption, compressionAlg CompressionAlgorithm, serializer func(*JSONWebEncryption) (string, error), corrupter func(*JSONWebEncryption) bool, aad []byte, encryptionKey interface{}, decryptionKey interface{}) error {
+	var rcpt Recipient
+	switch keyAlg {
+	case PBES2_HS256_A128KW, PBES2_HS384_A192KW, PBES2_HS512_A256KW:
+		// use 1k iterations instead of 100k to reduce computational cost
+		rcpt = Recipient{Algorithm: keyAlg, Key: encryptionKey, PBES2Count: 1000}
+	default:
+		rcpt = Recipient{Algorithm: keyAlg, Key: encryptionKey}
+	}
+	enc, err := NewEncrypter(encAlg, rcpt, &EncrypterOptions{Compression: compressionAlg})
 	if err != nil {
 		return fmt.Errorf("error on new encrypter: %s", err)
 	}
-
-	enc.SetCompression(compressionAlg)
 
 	input := []byte("Lorem ipsum dolor sit amet")
 	obj, err := enc.EncryptWithAuthData(input, aad)
@@ -64,7 +76,7 @@ func RoundtripJWE(keyAlg KeyAlgorithm, encAlg ContentEncryption, compressionAlg 
 		return fmt.Errorf("corrupter indicated message should be skipped")
 	}
 
-	if bytes.Compare(parsed.GetAuthData(), aad) != 0 {
+	if !bytes.Equal(parsed.GetAuthData(), aad) {
 		return fmt.Errorf("auth data in parsed object does not match")
 	}
 
@@ -73,7 +85,7 @@ func RoundtripJWE(keyAlg KeyAlgorithm, encAlg ContentEncryption, compressionAlg 
 		return fmt.Errorf("error on decrypt: %s", err)
 	}
 
-	if bytes.Compare(input, output) != 0 {
+	if !bytes.Equal(input, output) {
 		return fmt.Errorf("Decrypted output does not match input, got '%s' but wanted '%s'", output, input)
 	}
 
@@ -84,16 +96,18 @@ func TestRoundtripsJWE(t *testing.T) {
 	// Test matrix
 	keyAlgs := []KeyAlgorithm{
 		DIRECT, ECDH_ES, ECDH_ES_A128KW, ECDH_ES_A192KW, ECDH_ES_A256KW, A128KW, A192KW, A256KW,
-		RSA1_5, RSA_OAEP, RSA_OAEP_256, A128GCMKW, A192GCMKW, A256GCMKW}
+		RSA1_5, RSA_OAEP, RSA_OAEP_256, A128GCMKW, A192GCMKW, A256GCMKW,
+		PBES2_HS256_A128KW, PBES2_HS384_A192KW, PBES2_HS512_A256KW,
+	}
 	encAlgs := []ContentEncryption{A128GCM, A192GCM, A256GCM, A128CBC_HS256, A192CBC_HS384, A256CBC_HS512}
 	zipAlgs := []CompressionAlgorithm{NONE, DEFLATE}
 
-	serializers := []func(*JsonWebEncryption) (string, error){
-		func(obj *JsonWebEncryption) (string, error) { return obj.CompactSerialize() },
-		func(obj *JsonWebEncryption) (string, error) { return obj.FullSerialize(), nil },
+	serializers := []func(*JSONWebEncryption) (string, error){
+		func(obj *JSONWebEncryption) (string, error) { return obj.CompactSerialize() },
+		func(obj *JSONWebEncryption) (string, error) { return obj.FullSerialize(), nil },
 	}
 
-	corrupter := func(obj *JsonWebEncryption) bool { return false }
+	corrupter := func(obj *JSONWebEncryption) bool { return false }
 
 	// Note: can't use AAD with compact serialization
 	aads := [][]byte{
@@ -120,13 +134,13 @@ func TestRoundtripsJWE(t *testing.T) {
 
 func TestRoundtripsJWECorrupted(t *testing.T) {
 	// Test matrix
-	keyAlgs := []KeyAlgorithm{DIRECT, ECDH_ES, ECDH_ES_A128KW, A128KW, RSA1_5, RSA_OAEP, RSA_OAEP_256, A128GCMKW}
+	keyAlgs := []KeyAlgorithm{DIRECT, ECDH_ES, ECDH_ES_A128KW, A128KW, RSA1_5, RSA_OAEP, RSA_OAEP_256, A128GCMKW, PBES2_HS256_A128KW}
 	encAlgs := []ContentEncryption{A128GCM, A192GCM, A256GCM, A128CBC_HS256, A192CBC_HS384, A256CBC_HS512}
 	zipAlgs := []CompressionAlgorithm{NONE, DEFLATE}
 
-	serializers := []func(*JsonWebEncryption) (string, error){
-		func(obj *JsonWebEncryption) (string, error) { return obj.CompactSerialize() },
-		func(obj *JsonWebEncryption) (string, error) { return obj.FullSerialize(), nil },
+	serializers := []func(*JSONWebEncryption) (string, error){
+		func(obj *JSONWebEncryption) (string, error) { return obj.CompactSerialize() },
+		func(obj *JSONWebEncryption) (string, error) { return obj.FullSerialize(), nil },
 	}
 
 	bitflip := func(slice []byte) bool {
@@ -137,26 +151,34 @@ func TestRoundtripsJWECorrupted(t *testing.T) {
 		return true
 	}
 
-	corrupters := []func(*JsonWebEncryption) bool{
-		func(obj *JsonWebEncryption) bool {
+	corrupters := []func(*JSONWebEncryption) bool{
+		func(obj *JSONWebEncryption) bool {
 			// Set invalid ciphertext
 			return bitflip(obj.ciphertext)
 		},
-		func(obj *JsonWebEncryption) bool {
+		func(obj *JSONWebEncryption) bool {
 			// Set invalid auth tag
 			return bitflip(obj.tag)
 		},
-		func(obj *JsonWebEncryption) bool {
+		func(obj *JSONWebEncryption) bool {
 			// Set invalid AAD
 			return bitflip(obj.aad)
 		},
-		func(obj *JsonWebEncryption) bool {
+		func(obj *JSONWebEncryption) bool {
 			// Mess with encrypted key
 			return bitflip(obj.recipients[0].encryptedKey)
 		},
-		func(obj *JsonWebEncryption) bool {
+		func(obj *JSONWebEncryption) bool {
 			// Mess with GCM-KW auth tag
-			return bitflip(obj.protected.Tag.bytes())
+			tag, _ := obj.protected.getTag()
+			skip := bitflip(tag.bytes())
+			if skip {
+				return true
+			}
+			if err := obj.protected.set(headerTag, tag); err != nil {
+				t.Fatal(err)
+			}
+			return false
 		},
 	}
 
@@ -186,10 +208,10 @@ func TestRoundtripsJWECorrupted(t *testing.T) {
 }
 
 func TestEncrypterWithJWKAndKeyID(t *testing.T) {
-	enc, err := NewEncrypter(A128KW, A128GCM, &JsonWebKey{
+	enc, err := NewEncrypter(A128GCM, Recipient{Algorithm: A128KW, Key: &JSONWebKey{
 		KeyID: "test-id",
 		Key:   []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15},
-	})
+	}}, nil)
 	if err != nil {
 		t.Error(err)
 	}
@@ -211,11 +233,11 @@ func TestEncrypterWithJWKAndKeyID(t *testing.T) {
 }
 
 func TestEncrypterWithBrokenRand(t *testing.T) {
-	keyAlgs := []KeyAlgorithm{ECDH_ES_A128KW, A128KW, RSA1_5, RSA_OAEP, RSA_OAEP_256, A128GCMKW}
+	keyAlgs := []KeyAlgorithm{ECDH_ES_A128KW, A128KW, RSA1_5, RSA_OAEP, RSA_OAEP_256, A128GCMKW, PBES2_HS256_A128KW}
 	encAlgs := []ContentEncryption{A128GCM, A192GCM, A256GCM, A128CBC_HS256, A192CBC_HS384, A256CBC_HS512}
 
-	serializer := func(obj *JsonWebEncryption) (string, error) { return obj.CompactSerialize() }
-	corrupter := func(obj *JsonWebEncryption) bool { return false }
+	serializer := func(obj *JSONWebEncryption) (string, error) { return obj.CompactSerialize() }
+	corrupter := func(obj *JSONWebEncryption) bool { return false }
 
 	// Break rand reader
 	readers := []func() io.Reader{
@@ -231,7 +253,7 @@ func TestEncrypterWithBrokenRand(t *testing.T) {
 		for _, enc := range encAlgs {
 			for _, key := range generateTestKeys(alg, enc) {
 				for i, getReader := range readers {
-					randReader = getReader()
+					RandReader = getReader()
 					err := RoundtripJWE(alg, enc, NONE, serializer, corrupter, nil, key.enc, key.dec)
 					if err == nil {
 						t.Error("encrypter should fail if rand is broken", i)
@@ -243,46 +265,39 @@ func TestEncrypterWithBrokenRand(t *testing.T) {
 }
 
 func TestNewEncrypterErrors(t *testing.T) {
-	_, err := NewEncrypter("XYZ", "XYZ", nil)
+	_, err := NewEncrypter("XYZ", Recipient{}, nil)
 	if err == nil {
 		t.Error("was able to instantiate encrypter with invalid cipher")
 	}
 
-	_, err = NewMultiEncrypter("XYZ")
+	_, err = NewMultiEncrypter("XYZ", []Recipient{}, nil)
 	if err == nil {
 		t.Error("was able to instantiate multi-encrypter with invalid cipher")
 	}
 
-	_, err = NewEncrypter(DIRECT, A128GCM, nil)
+	_, err = NewEncrypter(A128GCM, Recipient{Algorithm: DIRECT, Key: nil}, nil)
 	if err == nil {
 		t.Error("was able to instantiate encrypter with invalid direct key")
 	}
 
-	_, err = NewEncrypter(ECDH_ES, A128GCM, nil)
+	_, err = NewEncrypter(A128GCM, Recipient{Algorithm: ECDH_ES, Key: nil}, nil)
 	if err == nil {
 		t.Error("was able to instantiate encrypter with invalid EC key")
 	}
 }
 
 func TestMultiRecipientJWE(t *testing.T) {
-	enc, err := NewMultiEncrypter(A128GCM)
-	if err != nil {
-		panic(err)
-	}
-
-	err = enc.AddRecipient(RSA_OAEP, &rsaTestKey.PublicKey)
-	if err != nil {
-		t.Fatal("error when adding RSA recipient", err)
-	}
-
 	sharedKey := []byte{
 		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 	}
 
-	err = enc.AddRecipient(A256GCMKW, sharedKey)
+	enc, err := NewMultiEncrypter(A128GCM, []Recipient{
+		{Algorithm: RSA_OAEP, Key: &rsaTestKey.PublicKey},
+		{Algorithm: A256GCMKW, Key: sharedKey},
+	}, nil)
 	if err != nil {
-		t.Fatal("error when adding AES recipient: ", err)
+		panic(err)
 	}
 
 	input := []byte("Lorem ipsum dolor sit amet")
@@ -307,7 +322,7 @@ func TestMultiRecipientJWE(t *testing.T) {
 		t.Fatal("recipient index should be 0 for RSA key")
 	}
 
-	if bytes.Compare(input, output) != 0 {
+	if !bytes.Equal(input, output) {
 		t.Fatal("Decrypted output does not match input: ", output, input)
 	}
 
@@ -320,36 +335,278 @@ func TestMultiRecipientJWE(t *testing.T) {
 		t.Fatal("recipient index should be 1 for shared key")
 	}
 
-	if bytes.Compare(input, output) != 0 {
+	if !bytes.Equal(input, output) {
 		t.Fatal("Decrypted output does not match input", output, input)
 	}
 }
 
 func TestMultiRecipientErrors(t *testing.T) {
-	enc, err := NewMultiEncrypter(A128GCM)
+	_, err := NewMultiEncrypter(A128GCM, []Recipient{}, nil)
+	if err == nil {
+		t.Error("should fail to instantiate with zero recipients")
+	}
+}
+
+func TestEncrypterOptions(t *testing.T) {
+	sharedKey := []byte{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+	}
+
+	opts := &EncrypterOptions{
+		Compression: DEFLATE,
+	}
+	opts.WithType("JWT")
+	opts.WithContentType("JWT")
+	enc, err := NewEncrypter(A256GCM, Recipient{Algorithm: A256GCMKW, Key: sharedKey}, opts)
 	if err != nil {
-		panic(err)
+		fmt.Println(err)
+		t.Error("Failed to create encrypter")
+	}
+
+	if !reflect.DeepEqual(*opts, enc.Options()) {
+		t.Error("Encrypter options do not match")
+	}
+}
+
+// Test that extra headers are generated and parsed in a round trip.
+func TestEncrypterExtraHeaderInclusion(t *testing.T) {
+	sharedKey := []byte{
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+		0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+	}
+
+	opts := &EncrypterOptions{
+		Compression: DEFLATE,
+	}
+	opts.WithType("JWT")
+	opts.WithContentType("JWT")
+	opts.WithHeader(HeaderKey("myCustomHeader"), "xyz")
+	enc, err := NewEncrypter(A256GCM, Recipient{Algorithm: A256GCMKW, Key: sharedKey}, opts)
+	if err != nil {
+		fmt.Println(err)
+		t.Error("Failed to create encrypter")
+	}
+
+	if !reflect.DeepEqual(*opts, enc.Options()) {
+		t.Error("Encrypter options do not match")
 	}
 
 	input := []byte("Lorem ipsum dolor sit amet")
-	_, err = enc.Encrypt(input)
-	if err == nil {
-		t.Error("should fail when encrypting to zero recipients")
+	obj, err := enc.Encrypt(input)
+	if err != nil {
+		t.Fatal("error in encrypt: ", err)
 	}
 
-	err = enc.AddRecipient(DIRECT, nil)
-	if err == nil {
-		t.Error("should reject DIRECT mode when encrypting to multiple recipients")
+	parsed, err := ParseEncrypted(obj.FullSerialize())
+	if err != nil {
+		t.Fatal("error in parse: ", err)
 	}
 
-	err = enc.AddRecipient(ECDH_ES, nil)
-	if err == nil {
-		t.Error("should reject ECDH_ES mode when encrypting to multiple recipients")
+	output, err := parsed.Decrypt(sharedKey)
+	if err != nil {
+		t.Fatal("error on decrypt: ", err)
 	}
 
-	err = enc.AddRecipient(RSA1_5, nil)
-	if err == nil {
-		t.Error("should reject invalid recipient key")
+	if !bytes.Equal(input, output) {
+		t.Fatal("Decrypted output does not match input: ", output, input)
+	}
+
+	if parsed.Header.ExtraHeaders[HeaderType] != "JWT" ||
+		parsed.Header.ExtraHeaders[HeaderContentType] != "JWT" ||
+		parsed.Header.ExtraHeaders[HeaderKey("myCustomHeader")] != "xyz" {
+		t.Fatalf("Mismatch in extra headers: %#v", parsed.Header.ExtraHeaders)
+	}
+}
+
+// TestPBES2JWKEncryption uses the plaintext and serialization reference of
+// JWK RFC https://tools.ietf.org/html/rfc7517#appendix-C.4
+func TestPBES2JWKEncryption(t *testing.T) {
+	passphrase := []byte("Thus from my lips, by yours, my sin is purged.")
+
+	plaintext := []byte(`{
+      "kty":"RSA",
+      "kid":"juliet@capulet.lit",
+      "use":"enc",
+      "n":"t6Q8PWSi1dkJj9hTP8hNYFlvadM7DflW9mWepOJhJ66w7nyoK1gPNqFMSQRy
+           O125Gp-TEkodhWr0iujjHVx7BcV0llS4w5ACGgPrcAd6ZcSR0-Iqom-QFcNP
+           8Sjg086MwoqQU_LYywlAGZ21WSdS_PERyGFiNnj3QQlO8Yns5jCtLCRwLHL0
+           Pb1fEv45AuRIuUfVcPySBWYnDyGxvjYGDSM-AqWS9zIQ2ZilgT-GqUmipg0X
+           OC0Cc20rgLe2ymLHjpHciCKVAbY5-L32-lSeZO-Os6U15_aXrk9Gw8cPUaX1
+           _I8sLGuSiVdt3C_Fn2PZ3Z8i744FPFGGcG1qs2Wz-Q",
+      "e":"AQAB",
+      "d":"GRtbIQmhOZtyszfgKdg4u_N-R_mZGU_9k7JQ_jn1DnfTuMdSNprTeaSTyWfS
+           NkuaAwnOEbIQVy1IQbWVV25NY3ybc_IhUJtfri7bAXYEReWaCl3hdlPKXy9U
+           vqPYGR0kIXTQRqns-dVJ7jahlI7LyckrpTmrM8dWBo4_PMaenNnPiQgO0xnu
+           ToxutRZJfJvG4Ox4ka3GORQd9CsCZ2vsUDmsXOfUENOyMqADC6p1M3h33tsu
+           rY15k9qMSpG9OX_IJAXmxzAh_tWiZOwk2K4yxH9tS3Lq1yX8C1EWmeRDkK2a
+           hecG85-oLKQt5VEpWHKmjOi_gJSdSgqcN96X52esAQ",
+      "p":"2rnSOV4hKSN8sS4CgcQHFbs08XboFDqKum3sc4h3GRxrTmQdl1ZK9uw-PIHf
+           QP0FkxXVrx-WE-ZEbrqivH_2iCLUS7wAl6XvARt1KkIaUxPPSYB9yk31s0Q8
+           UK96E3_OrADAYtAJs-M3JxCLfNgqh56HDnETTQhH3rCT5T3yJws",
+      "q":"1u_RiFDP7LBYh3N4GXLT9OpSKYP0uQZyiaZwBtOCBNJgQxaj10RWjsZu0c6I
+           edis4S7B_coSKB0Kj9PaPaBzg-IySRvvcQuPamQu66riMhjVtG6TlV8CLCYK
+           rYl52ziqK0E_ym2QnkwsUX7eYTB7LbAHRK9GqocDE5B0f808I4s",
+      "dp":"KkMTWqBUefVwZ2_Dbj1pPQqyHSHjj90L5x_MOzqYAJMcLMZtbUtwKqvVDq3
+           tbEo3ZIcohbDtt6SbfmWzggabpQxNxuBpoOOf_a_HgMXK_lhqigI4y_kqS1w
+           Y52IwjUn5rgRrJ-yYo1h41KR-vz2pYhEAeYrhttWtxVqLCRViD6c",
+      "dq":"AvfS0-gRxvn0bwJoMSnFxYcK1WnuEjQFluMGfwGitQBWtfZ1Er7t1xDkbN9
+           GQTB9yqpDoYaN06H7CFtrkxhJIBQaj6nkF5KKS3TQtQ5qCzkOkmxIe3KRbBy
+           mXxkb5qwUpX5ELD5xFc6FeiafWYY63TmmEAu_lRFCOJ3xDea-ots",
+      "qi":"lSQi-w9CpyUReMErP1RsBLk7wNtOvs5EQpPqmuMvqW57NBUczScEoPwmUqq
+           abu9V0-Py4dQ57_bapoKRu1R90bvuFnU63SHWEFglZQvJDMeAvmj4sm-Fp0o
+           Yu_neotgQ0hzbI5gry7ajdYy9-2lNx_76aBZoOUu9HCJ-UsfSOI8"
+     }`)
+
+	serializationReference := `
+	  eyJhbGciOiJQQkVTMi1IUzI1NitBMTI4S1ciLCJwMnMiOiIyV0NUY0paMVJ2ZF9DSn
+	  VKcmlwUTF3IiwicDJjIjo0MDk2LCJlbmMiOiJBMTI4Q0JDLUhTMjU2IiwiY3R5Ijoi
+	  andrK2pzb24ifQ.
+	  TrqXOwuNUfDV9VPTNbyGvEJ9JMjefAVn-TR1uIxR9p6hsRQh9Tk7BA.
+	  Ye9j1qs22DmRSAddIh-VnA.
+	  AwhB8lxrlKjFn02LGWEqg27H4Tg9fyZAbFv3p5ZicHpj64QyHC44qqlZ3JEmnZTgQo
+	  wIqZJ13jbyHB8LgePiqUJ1hf6M2HPLgzw8L-mEeQ0jvDUTrE07NtOerBk8bwBQyZ6g
+	  0kQ3DEOIglfYxV8-FJvNBYwbqN1Bck6d_i7OtjSHV-8DIrp-3JcRIe05YKy3Oi34Z_
+	  GOiAc1EK21B11c_AE11PII_wvvtRiUiG8YofQXakWd1_O98Kap-UgmyWPfreUJ3lJP
+	  nbD4Ve95owEfMGLOPflo2MnjaTDCwQokoJ_xplQ2vNPz8iguLcHBoKllyQFJL2mOWB
+	  wqhBo9Oj-O800as5mmLsvQMTflIrIEbbTMzHMBZ8EFW9fWwwFu0DWQJGkMNhmBZQ-3
+	  lvqTc-M6-gWA6D8PDhONfP2Oib2HGizwG1iEaX8GRyUpfLuljCLIe1DkGOewhKuKkZ
+	  h04DKNM5Nbugf2atmU9OP0Ldx5peCUtRG1gMVl7Qup5ZXHTjgPDr5b2N731UooCGAU
+	  qHdgGhg0JVJ_ObCTdjsH4CF1SJsdUhrXvYx3HJh2Xd7CwJRzU_3Y1GxYU6-s3GFPbi
+	  rfqqEipJDBTHpcoCmyrwYjYHFgnlqBZRotRrS95g8F95bRXqsaDY7UgQGwBQBwy665
+	  d0zpvTasvfXf_c0MWAl-neFaKOW_Px6g4EUDjG1GWSXV9cLStLw_0ovdApDIFLHYHe
+	  PyagyHjouQUuGiq7BsYwYrwaF06tgB8hV8omLNfMEmDPJaZUzMuHw6tBDwGkzD-tS_
+	  ub9hxrpJ4UsOWnt5rGUyoN2N_c1-TQlXxm5oto14MxnoAyBQBpwIEgSH3Y4ZhwKBhH
+	  PjSo0cdwuNdYbGPpb-YUvF-2NZzODiQ1OvWQBRHSbPWYz_xbGkgD504LRtqRwCO7CC
+	  _CyyURi1sEssPVsMJRX_U4LFEOc82TiDdqjKOjRUfKK5rqLi8nBE9soQ0DSaOoFQZi
+	  GrBrqxDsNYiAYAmxxkos-i3nX4qtByVx85sCE5U_0MqG7COxZWMOPEFrDaepUV-cOy
+	  rvoUIng8i8ljKBKxETY2BgPegKBYCxsAUcAkKamSCC9AiBxA0UOHyhTqtlvMksO7AE
+	  hNC2-YzPyx1FkhMoS4LLe6E_pFsMlmjA6P1NSge9C5G5tETYXGAn6b1xZbHtmwrPSc
+	  ro9LWhVmAaA7_bxYObnFUxgWtK4vzzQBjZJ36UTk4OTB-JvKWgfVWCFsaw5WCHj6Oo
+	  4jpO7d2yN7WMfAj2hTEabz9wumQ0TMhBduZ-QON3pYObSy7TSC1vVme0NJrwF_cJRe
+	  hKTFmdlXGVldPxZCplr7ZQqRQhF8JP-l4mEQVnCaWGn9ONHlemczGOS-A-wwtnmwjI
+	  B1V_vgJRf4FdpV-4hUk4-QLpu3-1lWFxrtZKcggq3tWTduRo5_QebQbUUT_VSCgsFc
+	  OmyWKoj56lbxthN19hq1XGWbLGfrrR6MWh23vk01zn8FVwi7uFwEnRYSafsnWLa1Z5
+	  TpBj9GvAdl2H9NHwzpB5NqHpZNkQ3NMDj13Fn8fzO0JB83Etbm_tnFQfcb13X3bJ15
+	  Cz-Ww1MGhvIpGGnMBT_ADp9xSIyAM9dQ1yeVXk-AIgWBUlN5uyWSGyCxp0cJwx7HxM
+	  38z0UIeBu-MytL-eqndM7LxytsVzCbjOTSVRmhYEMIzUAnS1gs7uMQAGRdgRIElTJE
+	  SGMjb_4bZq9s6Ve1LKkSi0_QDsrABaLe55UY0zF4ZSfOV5PMyPtocwV_dcNPlxLgNA
+	  D1BFX_Z9kAdMZQW6fAmsfFle0zAoMe4l9pMESH0JB4sJGdCKtQXj1cXNydDYozF7l8
+	  H00BV_Er7zd6VtIw0MxwkFCTatsv_R-GsBCH218RgVPsfYhwVuT8R4HarpzsDBufC4
+	  r8_c8fc9Z278sQ081jFjOja6L2x0N_ImzFNXU6xwO-Ska-QeuvYZ3X_L31ZOX4Llp-
+	  7QSfgDoHnOxFv1Xws-D5mDHD3zxOup2b2TppdKTZb9eW2vxUVviM8OI9atBfPKMGAO
+	  v9omA-6vv5IxUH0-lWMiHLQ_g8vnswp-Jav0c4t6URVUzujNOoNd_CBGGVnHiJTCHl
+	  88LQxsqLHHIu4Fz-U2SGnlxGTj0-ihit2ELGRv4vO8E1BosTmf0cx3qgG0Pq0eOLBD
+	  IHsrdZ_CCAiTc0HVkMbyq1M6qEhM-q5P6y1QCIrwg.
+	  0HFmhOzsQ98nNWJjIHkR7A`
+
+	// remove white spaces and line breaks
+	r := regexp.MustCompile(`\s`)
+	plaintext = r.ReplaceAll(plaintext, []byte(""))
+	serializationReference = r.ReplaceAllString(serializationReference, "")
+
+	rcpt := Recipient{
+		Algorithm:  PBES2_HS256_A128KW,
+		Key:        passphrase,
+		PBES2Count: 4096,
+		PBES2Salt: []byte{
+			217, 96, 147, 112, 150, 117, 70,
+			247, 127, 8, 155, 137, 174, 42, 80, 215,
+		},
+	}
+
+	enc, err := NewEncrypter(A128CBC_HS256, rcpt, nil)
+	if err != nil {
+		t.Fatal("error on NewEncrypter:", err)
+	}
+
+	obj, err := enc.Encrypt(plaintext)
+	if err != nil {
+		t.Fatal("error on new Encrypt:", err)
+	}
+
+	serialized, err := obj.CompactSerialize()
+	if err != nil {
+		t.Fatal("error on CompactSerialize")
+	}
+
+	jwe1, err := ParseEncrypted(serialized)
+	if err != nil {
+		t.Fatal("error in ParseEncrypted")
+	}
+
+	jwe2, err := ParseEncrypted(serializationReference)
+	if err != nil {
+		t.Fatal("error in ParseEncrypted")
+	}
+
+	original1, err := jwe1.Decrypt(passphrase)
+	if err != nil {
+		t.Fatal("error in Decrypt:", err)
+	}
+
+	original2, err := jwe2.Decrypt(passphrase)
+	if err != nil {
+		t.Fatal("error in Decrypt reference:", err)
+	}
+
+	if !bytes.Equal(original1, original2) {
+		t.Error("decryption does not match reference decryption")
+	}
+
+	if !bytes.Equal(plaintext, original1) {
+		t.Error("decryption does not match plaintext")
+	}
+
+	if !bytes.Equal(plaintext, original2) {
+		t.Error("reference decryption does not match plaintext")
+	}
+}
+
+func TestEncrypterWithPBES2(t *testing.T) {
+	expected := []byte("Lorem ipsum dolor sit amet")
+	algs := []KeyAlgorithm{
+		PBES2_HS256_A128KW, PBES2_HS384_A192KW, PBES2_HS512_A256KW,
+	}
+
+	// Check with both strings and []byte
+	recipientKeys := []interface{}{"password", []byte("password")}
+	for _, key := range recipientKeys {
+		for _, alg := range algs {
+			enc, err := NewEncrypter(A128GCM, Recipient{Algorithm: alg, Key: &JSONWebKey{
+				KeyID: "test-id",
+				Key:   key,
+			}}, nil)
+			if err != nil {
+				t.Error(err)
+			}
+
+			ciphertext, _ := enc.Encrypt(expected)
+
+			serialized1, _ := ciphertext.CompactSerialize()
+			serialized2 := ciphertext.FullSerialize()
+
+			parsed1, _ := ParseEncrypted(serialized1)
+			parsed2, _ := ParseEncrypted(serialized2)
+
+			actual1, err := parsed1.Decrypt("password")
+			if err != nil {
+				t.Fatal("error on Decrypt:", err)
+			}
+
+			actual2, err := parsed2.Decrypt([]byte("password"))
+			if err != nil {
+				t.Fatal("error on Decrypt:", err)
+			}
+
+			if !bytes.Equal(actual1, expected) {
+				t.Errorf("error comparing decrypted message (%s) and expected (%s)", actual1, expected)
+			}
+
+			if !bytes.Equal(actual2, expected) {
+				t.Errorf("error comparing decrypted message (%s) and expected (%s)", actual2, expected)
+			}
+		}
 	}
 }
 
@@ -361,14 +618,34 @@ func symmetricTestKey(size int) []testKey {
 	key, _, _ := randomKeyGenerator{size: size}.genKey()
 
 	return []testKey{
-		testKey{
+		{
 			enc: key,
 			dec: key,
 		},
-		testKey{
-			enc: &JsonWebKey{KeyID: "test", Key: key},
-			dec: &JsonWebKey{KeyID: "test", Key: key},
+		{
+			enc: &JSONWebKey{KeyID: "test", Key: key},
+			dec: &JSONWebKey{KeyID: "test", Key: key},
 		},
+	}
+}
+
+func TestDirectEncryptionKeySizeCheck(t *testing.T) {
+	// 16-byte key
+	key16 := []byte("0123456789ABCDEF")
+
+	// 32-byte key
+	key32 := []byte("0123456789ABCDEF0123456789ABCDEF")
+
+	// AES-128 with 32-byte key should reject
+	_, err := NewEncrypter(A128GCM, Recipient{Algorithm: DIRECT, Key: key32}, nil)
+	if err != ErrInvalidKeySize {
+		t.Error("Should reject AES-128 with 32-byte key")
+	}
+
+	// AES-256 with 16-byte key should reject
+	_, err = NewEncrypter(A256GCM, Recipient{Algorithm: DIRECT, Key: key16}, nil)
+	if err != ErrInvalidKeySize {
+		t.Error("Should reject AES-256 with 16-byte key")
 	}
 }
 
@@ -378,21 +655,21 @@ func generateTestKeys(keyAlg KeyAlgorithm, encAlg ContentEncryption) []testKey {
 		return symmetricTestKey(getContentCipher(encAlg).keySize())
 	case ECDH_ES, ECDH_ES_A128KW, ECDH_ES_A192KW, ECDH_ES_A256KW:
 		return []testKey{
-			testKey{
+			{
 				dec: ecTestKey256,
 				enc: &ecTestKey256.PublicKey,
 			},
-			testKey{
+			{
 				dec: ecTestKey384,
 				enc: &ecTestKey384.PublicKey,
 			},
-			testKey{
+			{
 				dec: ecTestKey521,
 				enc: &ecTestKey521.PublicKey,
 			},
-			testKey{
-				dec: &JsonWebKey{KeyID: "test", Key: ecTestKey256},
-				enc: &JsonWebKey{KeyID: "test", Key: &ecTestKey256.PublicKey},
+			{
+				dec: &JSONWebKey{KeyID: "test", Key: ecTestKey256},
+				enc: &JSONWebKey{KeyID: "test", Key: &ecTestKey256.PublicKey},
 			},
 		}
 	case A128GCMKW, A128KW:
@@ -402,29 +679,20 @@ func generateTestKeys(keyAlg KeyAlgorithm, encAlg ContentEncryption) []testKey {
 	case A256GCMKW, A256KW:
 		return symmetricTestKey(32)
 	case RSA1_5, RSA_OAEP, RSA_OAEP_256:
-		return []testKey{testKey{
+		return []testKey{{
 			dec: rsaTestKey,
 			enc: &rsaTestKey.PublicKey,
 		}}
+	case PBES2_HS256_A128KW, PBES2_HS384_A192KW, PBES2_HS512_A256KW:
+		// size does not matter, use random integer
+		i, err := rand.Int(rand.Reader, big.NewInt(64))
+		if err != nil {
+			panic(err)
+		}
+		return symmetricTestKey(int(i.Int64()))
 	}
 
 	panic("Must update test case")
-}
-
-func RunRoundtripsJWE(b *testing.B, alg KeyAlgorithm, enc ContentEncryption, zip CompressionAlgorithm, priv, pub interface{}) {
-	serializer := func(obj *JsonWebEncryption) (string, error) {
-		return obj.CompactSerialize()
-	}
-
-	corrupter := func(obj *JsonWebEncryption) bool { return false }
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		err := RoundtripJWE(alg, enc, zip, serializer, corrupter, nil, pub, priv)
-		if err != nil {
-			b.Error(err)
-		}
-	}
 }
 
 var (
@@ -437,19 +705,21 @@ var (
 		"64MB": make([]byte, 67108864),
 	}
 
-	symKey, _, _ = randomKeyGenerator{size: 32}.genKey()
+	symKey16, _, _ = randomKeyGenerator{size: 16}.genKey()
+	symKey32, _, _ = randomKeyGenerator{size: 32}.genKey()
+	symKey64, _, _ = randomKeyGenerator{size: 64}.genKey()
 
 	encrypters = map[string]Encrypter{
 		"OAEPAndGCM":          mustEncrypter(RSA_OAEP, A128GCM, &rsaTestKey.PublicKey),
 		"PKCSAndGCM":          mustEncrypter(RSA1_5, A128GCM, &rsaTestKey.PublicKey),
 		"OAEPAndCBC":          mustEncrypter(RSA_OAEP, A128CBC_HS256, &rsaTestKey.PublicKey),
 		"PKCSAndCBC":          mustEncrypter(RSA1_5, A128CBC_HS256, &rsaTestKey.PublicKey),
-		"DirectGCM128":        mustEncrypter(DIRECT, A128GCM, symKey),
-		"DirectCBC128":        mustEncrypter(DIRECT, A128CBC_HS256, symKey),
-		"DirectGCM256":        mustEncrypter(DIRECT, A256GCM, symKey),
-		"DirectCBC256":        mustEncrypter(DIRECT, A256CBC_HS512, symKey),
-		"AESKWAndGCM128":      mustEncrypter(A128KW, A128GCM, symKey),
-		"AESKWAndCBC256":      mustEncrypter(A256KW, A256GCM, symKey),
+		"DirectGCM128":        mustEncrypter(DIRECT, A128GCM, symKey16),
+		"DirectCBC128":        mustEncrypter(DIRECT, A128CBC_HS256, symKey32),
+		"DirectGCM256":        mustEncrypter(DIRECT, A256GCM, symKey32),
+		"DirectCBC256":        mustEncrypter(DIRECT, A256CBC_HS512, symKey64),
+		"AESKWAndGCM128":      mustEncrypter(A128KW, A128GCM, symKey16),
+		"AESKWAndCBC256":      mustEncrypter(A256KW, A256GCM, symKey32),
 		"ECDHOnP256AndGCM128": mustEncrypter(ECDH_ES, A128GCM, &ecTestKey256.PublicKey),
 		"ECDHOnP384AndGCM128": mustEncrypter(ECDH_ES, A128GCM, &ecTestKey384.PublicKey),
 		"ECDHOnP521AndGCM128": mustEncrypter(ECDH_ES, A128GCM, &ecTestKey521.PublicKey),
@@ -596,7 +866,9 @@ func benchEncrypt(chunkKey, primKey string, b *testing.B) {
 
 	b.SetBytes(int64(len(data)))
 	for i := 0; i < b.N; i++ {
-		enc.Encrypt(data)
+		if _, err := enc.Encrypt(data); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
@@ -607,13 +879,13 @@ var (
 		"OAEPAndCBC": rsaTestKey,
 		"PKCSAndCBC": rsaTestKey,
 
-		"DirectGCM128": symKey,
-		"DirectCBC128": symKey,
-		"DirectGCM256": symKey,
-		"DirectCBC256": symKey,
+		"DirectGCM128": symKey16,
+		"DirectCBC128": symKey32,
+		"DirectGCM256": symKey32,
+		"DirectCBC256": symKey64,
 
-		"AESKWAndGCM128": symKey,
-		"AESKWAndCBC256": symKey,
+		"AESKWAndGCM128": symKey16,
+		"AESKWAndCBC256": symKey32,
 
 		"ECDHOnP256AndGCM128": ecTestKey256,
 		"ECDHOnP384AndGCM128": ecTestKey384,
@@ -772,12 +1044,14 @@ func benchDecrypt(chunkKey, primKey string, b *testing.B) {
 	b.SetBytes(int64(len(chunk)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		data.Decrypt(dec)
+		if _, err := data.Decrypt(dec); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 
 func mustEncrypter(keyAlg KeyAlgorithm, encAlg ContentEncryption, encryptionKey interface{}) Encrypter {
-	enc, err := NewEncrypter(keyAlg, encAlg, encryptionKey)
+	enc, err := NewEncrypter(encAlg, Recipient{Algorithm: keyAlg, Key: encryptionKey}, nil)
 	if err != nil {
 		panic(err)
 	}

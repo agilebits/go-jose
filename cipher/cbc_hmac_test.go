@@ -111,10 +111,10 @@ func TestVectorsAESCBC128(t *testing.T) {
 		return
 	}
 
-	if bytes.Compare(out[:len(out)-16], expectedCiphertext) != 0 {
+	if !bytes.Equal(out[:len(out)-16], expectedCiphertext) {
 		t.Error("Ciphertext did not match")
 	}
-	if bytes.Compare(out[len(out)-16:], expectedAuthtag) != 0 {
+	if !bytes.Equal(out[len(out)-16:], expectedAuthtag) {
 		t.Error("Auth tag did not match")
 	}
 }
@@ -167,10 +167,10 @@ func TestVectorsAESCBC256(t *testing.T) {
 		return
 	}
 
-	if bytes.Compare(out[:len(out)-32], expectedCiphertext) != 0 {
+	if !bytes.Equal(out[:len(out)-32], expectedCiphertext) {
 		t.Error("Ciphertext did not match, got", out[:len(out)-32], "wanted", expectedCiphertext)
 	}
-	if bytes.Compare(out[len(out)-32:], expectedAuthtag) != 0 {
+	if !bytes.Equal(out[len(out)-32:], expectedAuthtag) {
 		t.Error("Auth tag did not match, got", out[len(out)-32:], "wanted", expectedAuthtag)
 	}
 }
@@ -215,7 +215,7 @@ func RunRoundtrip(t *testing.T, key, nonce []byte) {
 	aad := []byte{4, 3, 2, 1}
 
 	result := aead.Seal(dst, nonce, plaintext, aad)
-	if bytes.Compare(dst, result[:4]) != 0 {
+	if !bytes.Equal(dst, result[:4]) {
 		t.Error("Existing data in dst not preserved")
 	}
 
@@ -226,7 +226,7 @@ func RunRoundtrip(t *testing.T, key, nonce []byte) {
 		panic(err)
 	}
 
-	if bytes.Compare(result, plaintext) != 0 {
+	if !bytes.Equal(result, plaintext) {
 		t.Error("Plaintext does not match output")
 	}
 }
@@ -271,12 +271,17 @@ func TestTruncatedCiphertext(t *testing.T) {
 	nonce := make([]byte, 16)
 	data := make([]byte, 32)
 
-	io.ReadFull(rand.Reader, key)
-	io.ReadFull(rand.Reader, nonce)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		t.Fatal(err)
+	}
 
 	aead, err := NewCBCHMAC(key, aes.NewCipher)
 	if err != nil {
-		panic(err)
+		t.Fatal(err)
 	}
 
 	ctx := aead.(*cbcAEAD)
@@ -301,8 +306,13 @@ func TestInvalidPaddingOpen(t *testing.T) {
 	plaintext := padBuffer(make([]byte, 28), aes.BlockSize)
 	plaintext[len(plaintext)-1] = 0xFF
 
-	io.ReadFull(rand.Reader, key)
-	io.ReadFull(rand.Reader, nonce)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		t.Fatal(err)
+	}
 
 	block, _ := aes.NewCipher(key)
 	cbc := cipher.NewCBCEncrypter(block, nonce)
@@ -359,7 +369,7 @@ func TestInvalidPadding(t *testing.T) {
 
 func TestZeroLengthPadding(t *testing.T) {
 	data := make([]byte, 16)
-	data, err := unpadBuffer(data, 16)
+	_, err := unpadBuffer(data, 16)
 	if err == nil {
 		t.Error("padding with 0x00 should never be valid")
 	}
@@ -369,14 +379,19 @@ func benchEncryptCBCHMAC(b *testing.B, keySize, chunkSize int) {
 	key := make([]byte, keySize*2)
 	nonce := make([]byte, 16)
 
-	io.ReadFull(rand.Reader, key)
-	io.ReadFull(rand.Reader, nonce)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		b.Fatal(err)
+	}
+
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		b.Fatal(err)
+	}
 
 	chunk := make([]byte, chunkSize)
 
 	aead, err := NewCBCHMAC(key, aes.NewCipher)
 	if err != nil {
-		panic(err)
+		b.Fatal(err)
 	}
 
 	b.SetBytes(int64(chunkSize))
@@ -390,14 +405,19 @@ func benchDecryptCBCHMAC(b *testing.B, keySize, chunkSize int) {
 	key := make([]byte, keySize*2)
 	nonce := make([]byte, 16)
 
-	io.ReadFull(rand.Reader, key)
-	io.ReadFull(rand.Reader, nonce)
+	if _, err := io.ReadFull(rand.Reader, key); err != nil {
+		b.Fatal(err)
+	}
+
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		b.Fatal(err)
+	}
 
 	chunk := make([]byte, chunkSize)
 
 	aead, err := NewCBCHMAC(key, aes.NewCipher)
 	if err != nil {
-		panic(err)
+		b.Fatal(err)
 	}
 
 	out := aead.Seal(nil, nonce, chunk, nil)
@@ -405,7 +425,9 @@ func benchDecryptCBCHMAC(b *testing.B, keySize, chunkSize int) {
 	b.SetBytes(int64(chunkSize))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		aead.Open(nil, nonce, out, nil)
+		if _, err = aead.Open(nil, nonce, out, nil); err != nil {
+			b.Fatal(err)
+		}
 	}
 }
 

@@ -20,16 +20,23 @@ import (
 	"bytes"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/hex"
-	"fmt"
 	"math/big"
 	"reflect"
+	"strings"
 	"testing"
 
-	"github.com/square/go-jose/json"
+	"github.com/square/go-jose/v3/json"
+
+	"github.com/google/go-cmp/cmp"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // Test chain of two X.509 certificates
@@ -120,6 +127,42 @@ func TestRoundtripRsaPrivate(t *testing.T) {
 	}
 }
 
+func TestRoundtripRsaPrivatePrecomputed(t *testing.T) {
+	// Isolate a shallow copy of the rsaTestKey to avoid polluting it with Precompute
+	localKey := &(*rsaTestKey)
+	localKey.Precompute()
+
+	jwk, err := fromRsaPrivateKey(localKey)
+	if err != nil {
+		t.Error("problem constructing JWK from rsa key", err)
+	}
+
+	rsa2, err := jwk.rsaPrivateKey()
+	if err != nil {
+		t.Error("problem converting RSA private -> JWK", err)
+	}
+
+	if rsa2.Precomputed.Dp == nil {
+		t.Error("RSA private Dp nil")
+	}
+	if rsa2.Precomputed.Dq == nil {
+		t.Error("RSA private Dq nil")
+	}
+	if rsa2.Precomputed.Qinv == nil {
+		t.Error("RSA private Qinv nil")
+	}
+
+	if rsa2.Precomputed.Dp.Cmp(localKey.Precomputed.Dp) != 0 {
+		t.Error("RSA private Dp mismatch")
+	}
+	if rsa2.Precomputed.Dq.Cmp(localKey.Precomputed.Dq) != 0 {
+		t.Error("RSA private Dq mismatch")
+	}
+	if rsa2.Precomputed.Qinv.Cmp(localKey.Precomputed.Qinv) != 0 {
+		t.Error("RSA private Qinv mismatch")
+	}
+}
+
 func TestRsaPrivateInsufficientPrimes(t *testing.T) {
 	brokenRsaPrivateKey := rsa.PrivateKey{
 		PublicKey: rsa.PublicKey{
@@ -159,6 +202,9 @@ func TestRsaPrivateExcessPrimes(t *testing.T) {
 func TestRoundtripEcPublic(t *testing.T) {
 	for i, ecTestKey := range []*ecdsa.PrivateKey{ecTestKey256, ecTestKey384, ecTestKey521} {
 		jwk, err := fromEcPublicKey(&ecTestKey.PublicKey)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		ec2, err := jwk.ecPublicKey()
 		if err != nil {
@@ -180,10 +226,13 @@ func TestRoundtripEcPublic(t *testing.T) {
 func TestRoundtripEcPrivate(t *testing.T) {
 	for i, ecTestKey := range []*ecdsa.PrivateKey{ecTestKey256, ecTestKey384, ecTestKey521} {
 		jwk, err := fromEcPrivateKey(ecTestKey)
+		if err != nil {
+			t.Fatal(err)
+		}
 
 		ec2, err := jwk.ecPrivateKey()
 		if err != nil {
-			t.Error("problem converting ECDSA private -> JWK", i, err)
+			t.Fatalf("problem converting ECDSA private -> JWK for %#v: %s", ecTestKey, err)
 		}
 
 		if !reflect.DeepEqual(ec2.Curve, ecTestKey.Curve) {
@@ -201,44 +250,255 @@ func TestRoundtripEcPrivate(t *testing.T) {
 	}
 }
 
-func TestRoundtripX5C(t *testing.T) {
-	jwk := JsonWebKey{
-		Key:          rsaTestKey,
-		KeyID:        "bar",
-		Algorithm:    "foo",
-		Certificates: testCertificates,
+func TestRoundtripX509(t *testing.T) {
+	x5tSHA1 := sha1.Sum(testCertificates[0].Raw)
+	x5tSHA256 := sha256.Sum256(testCertificates[0].Raw)
+
+	cases := []struct {
+		name string
+		jwk  JSONWebKey
+	}{
+		{
+			name: "all fields",
+			jwk: JSONWebKey{
+				Key:                         testCertificates[0].PublicKey,
+				KeyID:                       "bar",
+				Algorithm:                   "foo",
+				Certificates:                testCertificates,
+				CertificateThumbprintSHA1:   x5tSHA1[:],
+				CertificateThumbprintSHA256: x5tSHA256[:],
+			},
+		},
+		{
+			name: "no optional x5ts",
+			jwk: JSONWebKey{
+				Key:          testCertificates[0].PublicKey,
+				KeyID:        "bar",
+				Algorithm:    "foo",
+				Certificates: testCertificates,
+			},
+		},
+		{
+			name: "no x5t",
+			jwk: JSONWebKey{
+				Key:                         testCertificates[0].PublicKey,
+				KeyID:                       "bar",
+				Algorithm:                   "foo",
+				Certificates:                testCertificates,
+				CertificateThumbprintSHA256: x5tSHA256[:],
+			},
+		},
+		{
+			name: "no x5t#S256",
+			jwk: JSONWebKey{
+				Key:                       testCertificates[0].PublicKey,
+				KeyID:                     "bar",
+				Algorithm:                 "foo",
+				Certificates:              testCertificates,
+				CertificateThumbprintSHA1: x5tSHA1[:],
+			},
+		},
 	}
 
-	jsonbar, err := jwk.MarshalJSON()
-	if err != nil {
-		t.Error("problem marshaling", err)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			jsonbar, err := c.jwk.MarshalJSON()
+			require.NoError(t, err)
+
+			var jwk2 JSONWebKey
+			err = jwk2.UnmarshalJSON(jsonbar)
+			require.NoError(t, err)
+
+			if !reflect.DeepEqual(testCertificates, jwk2.Certificates) {
+				t.Error("Certificates not equal", c.jwk.Certificates, jwk2.Certificates)
+			}
+
+			jsonbar2, err := jwk2.MarshalJSON()
+			require.NoError(t, err)
+
+			require.Empty(t, cmp.Diff(jsonbar, jsonbar2))
+			if !bytes.Equal(jsonbar, jsonbar2) {
+				t.Error("roundtrip should not lose information")
+			}
+		})
+	}
+}
+
+func TestRoundtripX509Hex(t *testing.T) {
+	var hexJWK = `{
+   "kty":"RSA",
+   "kid":"bar",
+   "alg":"foo",
+   "n":"u7LUr30Mhrh8N79-H4rKiHQ123q6xaBZPYbf1nV4GM19rizSnbEfyebG1kpfCv-XY6c499XiM6lOvcPL-0goTOcfW6Lg7AAR895GbnMeXEmnxICaI8rAZHK6t1WPmiWp82y_qhK2F_pYUaT3GSuiTFiMGq_GNwdpWuMlsInnnMNv1nxFbxtDPwzmCp0fEBxbH5d1EtXZwTPOHMyj8rfa-NIA5Nl4h_5RrbOWveKwBr26_CDAratJgOWh9xcd5g0ot_uDGcMoAgB6xeTuYklfaxCPptvu49kvoxw1J71fp6nKW_ZuhDRAp2F_BQ9inKpTo05sPLJg8tPTdjaeouOuJQ",
+   "e":"AQAB",
+   "x5c":[
+      "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"
+	],
+	"x5t": "MDYxMjU0ZmRmNzIwZjJjMGU0YmQzZjMzMzlhMmZlNTM1MGExNWRlMQ",
+	"x5t#S256": "MjAzMjRhNGI5MmYxMjI2OGVmOWFlMDI1ZmQ1Yzc5ZDE1OGZmNzQ1NzQwMDkyMTk2ZTgzNTNjMDAzMTUxNzUxMQ"
+}`
+
+	// json output
+	var output = `{
+	"kty":"RSA",
+	"kid":"bar",
+	"alg":"foo",
+	"n":"u7LUr30Mhrh8N79-H4rKiHQ123q6xaBZPYbf1nV4GM19rizSnbEfyebG1kpfCv-XY6c499XiM6lOvcPL-0goTOcfW6Lg7AAR895GbnMeXEmnxICaI8rAZHK6t1WPmiWp82y_qhK2F_pYUaT3GSuiTFiMGq_GNwdpWuMlsInnnMNv1nxFbxtDPwzmCp0fEBxbH5d1EtXZwTPOHMyj8rfa-NIA5Nl4h_5RrbOWveKwBr26_CDAratJgOWh9xcd5g0ot_uDGcMoAgB6xeTuYklfaxCPptvu49kvoxw1J71fp6nKW_ZuhDRAp2F_BQ9inKpTo05sPLJg8tPTdjaeouOuJQ",
+	"e":"AQAB",
+	"x5c":[
+		"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"
+	],
+	"x5t":"BhJU_fcg8sDkvT8zOaL-U1ChXeE",
+	"x5t#S256":"IDJKS5LxImjvmuAl_Vx50Vj_dFdACSGW6DU8ADFRdRE"
+	}`
+
+	var jwk2 JSONWebKey
+	err := jwk2.UnmarshalJSON([]byte(hexJWK))
+	require.NoError(t, err)
+
+	js, err := jwk2.MarshalJSON()
+	require.NoError(t, err)
+
+	var j1, j2 map[string]interface{}
+	require.NoError(t, json.Unmarshal(js, &j1))
+	require.NoError(t, json.Unmarshal([]byte(output), &j2))
+	require.Empty(t, cmp.Diff(j1, j2))
+}
+
+func TestInvalidThumbprintsX509(t *testing.T) {
+	// Too short
+	jwk := JSONWebKey{
+		Key:                         rsaTestKey,
+		KeyID:                       "bar",
+		Algorithm:                   "foo",
+		Certificates:                testCertificates,
+		CertificateThumbprintSHA1:   []byte{0x01}, // invalid length
+		CertificateThumbprintSHA256: []byte{0x02}, // invalid length
 	}
 
-	var jwk2 JsonWebKey
-	err = jwk2.UnmarshalJSON(jsonbar)
-	if err != nil {
-		t.Error("problem unmarshalling", err)
+	_, err := jwk.MarshalJSON()
+	if err == nil {
+		t.Error("should not marshal JWK with too short thumbprints")
 	}
 
-	if !reflect.DeepEqual(testCertificates, jwk2.Certificates) {
-		t.Error("Certificates not equal", jwk.Certificates, jwk2.Certificates)
+	// Mismatched (leaf has different sum)
+	sha1sum := sha1.Sum(nil)
+	jwk.CertificateThumbprintSHA1 = sha1sum[:]
+	sha256sum := sha256.Sum256(nil)
+	jwk.CertificateThumbprintSHA256 = sha256sum[:]
+
+	_, err = jwk.MarshalJSON()
+	if err == nil {
+		t.Error("should not marshal JWK with mismatched thumbprints")
 	}
 
-	jsonbar2, err := jwk2.MarshalJSON()
-	if err != nil {
-		t.Error("problem marshaling", err)
+	// Too short
+	shortThumbprints := []byte(`{
+  "kty": "RSA",
+  "kid": "bar",
+  "alg": "foo",
+  "n": "wN3v274Fr7grvZdXirEGkHlhYKh72gP-46MxQilMgANi6EaX2m0mYiMC60X1UmOhQNoVW0ItthMME-CGh7haA_Jeou_L6-EVOz-7lGu_J06VRl-mgkQZO0sYSkRY8Rsu7TW-pgnWWwZjSdgxN2gq7DvjjC4RLroV94Lgrb2Qwx6J5bZNOfj3pHmEWZ_eRFEH73Ct5RxwUKtNKx_XAmodZn9oFXBlN7F2Js-4DO-8UgbS7ALkTmhDzClT1GPfdLMusmXw4BXyV72vBOWrbUTdwk4pG8ahPQ0cGQ1ubaAmro_k3Bxg06voWPhXx7ALrpzmZCzr6YY-c5Y5rku4qXh-HQ",
+  "e": "AQAB",
+  "d": "RRM3xMvZ3YVopQ5_G_0rDLNsXOH6-apUr9LS4Y9JBtAvrGEcIe7VwHApq3ny0v870a5J19Vr6boIqVXQ2Or90kwL-O9JacHDiOTamd29KKbMb9fyGtWo88OBf5fbAv9pXyvQjEcZrqArD1eOyPlV5iXM6XfWT5X2KB-HuLIcFsVJSEb0yw943dEhZKkv2fySlVtKEhji2CfkMWP438G8auxwFPNIXmuvA1xvcAepOiI9I1Wy17txLOQg8MYBl98F7mxPUMpL3jm8-CSuxpknucFuFIrqIsbGmukSNp14APcu7bN0cJW5uVW-XtGbuioJkPjU2YJgfhIeMI8kuny5QQ",
+  "p": "yRNzbsreZK9MqJgbVsbl7SX2MyyJW_JnFKGdyrXzMqCtzRS7XJ9L3SwdDG_ERgSCkT9PP2dax9fS7RghHNJIU_NlPnJqzBPvPyzbjho7hcGYGDU2UO8E3SBP1WKm1SnlYhm1uHwrHudAO0D5jhVYQfRwem-zX3QibrsxEyxSELM",
+  "q": "9Yx0zzrhSxdE8ubryZfOyOw6cSbUdyCMgY3IFmEdb_UDZOQNMDCFj2RS1g6yFGKuaFqnL9ZRnmprikf20w-mu-LtLU_l0eK4U7pbAoB--pxFP_O6Yk3ZBu_YJ3FpimyX1v4OVZT-JOU_caKiTrPnlw3P7KbEc9iu_bOc8dE-_e8",
+  "dp": "GwiFbXDS44B58vS4QDtvcCm5Zvnm4bi-SRTNbRJ3Rug5Vagi5Hn6LhsfMKvaHHvAvhxf4CtaFiIbFos28HQJC1he1T12xEct1DWIsxstw3bapu6IhesMoVoVwZ-IxIHkeALy3oG7HmWCyjSbGJIgEoX1lVBtMjkf4_lAyM4dnmc",
+  "dq": "XYtXyMbOo3PG8Z6lfxRVU9gi346CbKu6u3RPIK94rnkyBNKYb55ck2cN47yPfRKnDNxUSvYj--zg8To_PuL8iyGFZ7jDffUYcdVR7J8VQNYdz6JDhEXSA0GGIGilY3XBVsdMoK_1Lgsj41-o48DH3pUFfEuAFf4blE1D4h_sFoM",
+  "qi": "CN3q5TMZO06DlK4onrJ687bPp2GE-fynd7ADPdf1ek3cXbeaFApVNp4w-i8zr7IVugQohn01i_jnkymw4UN-acoIzX2sGYhgDm6le1jyfv28bQ_Z5hT0rFNlPfGyK0kkPYUTxZ4ZCKpCYJT9C1nH58Yu4xFk4VR1zhULegjCCd4",
+  "x5c": [
+    "MIIDfDCCAmSgAwIBAgIJANWAkzF7PA8/MA0GCSqGSIb3DQEBCwUAMFUxCzAJBgNVBAYTAlVTMQswCQYDVQQIEwJDQTEQMA4GA1UEChMHY2VydGlnbzEQMA4GA1UECxMHZXhhbXBsZTEVMBMGA1UEAxMMZXhhbXBsZS1sZWFmMB4XDTE2MDYxMDIyMTQxMVoXDTIzMDQxNTIyMTQxMVowVTELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRAwDgYDVQQKEwdjZXJ0aWdvMRAwDgYDVQQLEwdleGFtcGxlMRUwEwYDVQQDEwxleGFtcGxlLWxlYWYwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC7stSvfQyGuHw3v34fisqIdDXberrFoFk9ht/WdXgYzX2uLNKdsR/J5sbWSl8K/5djpzj31eIzqU69w8v7SChM5x9bouDsABHz3kZucx5cSafEgJojysBkcrq3VY+aJanzbL+qErYX+lhRpPcZK6JMWIwar8Y3B2la4yWwieecw2/WfEVvG0M/DOYKnR8QHFsfl3US1dnBM84czKPyt9r40gDk2XiH/lGts5a94rAGvbr8IMCtq0mA5aH3Fx3mDSi3+4MZwygCAHrF5O5iSV9rEI+m2+7j2S+jHDUnvV+nqcpb9m6ENECnYX8FD2KcqlOjTmw8smDy09N2Np6i464lAgMBAAGjTzBNMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDATAsBgNVHREEJTAjhwR/AAABhxAAAAAAAAAAAAAAAAAAAAABgglsb2NhbGhvc3QwDQYJKoZIhvcNAQELBQADggEBAGM4aa/qrURUweZBIwZYv8O9b2+r4l0HjGAh982/B9sMlM05kojyDCUGvj86z18Lm8mKr4/y+i0nJ+vDIksEvfDuzw5ALAXGcBzPJKtICUf7LstA/n9NNpshWz0kld9ylnB5mbUzSFDncVyeXkEf5sGQXdIIZT9ChRBoiloSaa7dvBVCcsX1LGP2LWqKtD+7nUnw5qCwtyAVT8pthEUxFTpywoiJS5ZdzeEx8MNGvUeLFj2kleqPF78EioEQlSOxViCuctEtnQuPcDLHNFr10byTZY9roObiqdsJLMVvb2XliJjAqaPa9AkYwGE6xHw2ispwg64Rse0+AtKups19WIU="
+  ],
+  "x5t": "BhJU_fcg8sDkvT8zOaL-U1C",
+  "x5t#S256": "IDJKS5LxImjvmuAl_Vx50Vj_dFdACSGW6DU8ADF"
+}`)
+
+	// Mismatched (leaf has different sum)
+	mismatchedThumbprints := []byte(`{
+  "kty": "RSA",
+  "kid": "bar",
+  "alg": "foo",
+  "n": "wN3v274Fr7grvZdXirEGkHlhYKh72gP-46MxQilMgANi6EaX2m0mYiMC60X1UmOhQNoVW0ItthMME-CGh7haA_Jeou_L6-EVOz-7lGu_J06VRl-mgkQZO0sYSkRY8Rsu7TW-pgnWWwZjSdgxN2gq7DvjjC4RLroV94Lgrb2Qwx6J5bZNOfj3pHmEWZ_eRFEH73Ct5RxwUKtNKx_XAmodZn9oFXBlN7F2Js-4DO-8UgbS7ALkTmhDzClT1GPfdLMusmXw4BXyV72vBOWrbUTdwk4pG8ahPQ0cGQ1ubaAmro_k3Bxg06voWPhXx7ALrpzmZCzr6YY-c5Y5rku4qXh-HQ",
+  "e": "AQAB",
+  "d": "RRM3xMvZ3YVopQ5_G_0rDLNsXOH6-apUr9LS4Y9JBtAvrGEcIe7VwHApq3ny0v870a5J19Vr6boIqVXQ2Or90kwL-O9JacHDiOTamd29KKbMb9fyGtWo88OBf5fbAv9pXyvQjEcZrqArD1eOyPlV5iXM6XfWT5X2KB-HuLIcFsVJSEb0yw943dEhZKkv2fySlVtKEhji2CfkMWP438G8auxwFPNIXmuvA1xvcAepOiI9I1Wy17txLOQg8MYBl98F7mxPUMpL3jm8-CSuxpknucFuFIrqIsbGmukSNp14APcu7bN0cJW5uVW-XtGbuioJkPjU2YJgfhIeMI8kuny5QQ",
+  "p": "yRNzbsreZK9MqJgbVsbl7SX2MyyJW_JnFKGdyrXzMqCtzRS7XJ9L3SwdDG_ERgSCkT9PP2dax9fS7RghHNJIU_NlPnJqzBPvPyzbjho7hcGYGDU2UO8E3SBP1WKm1SnlYhm1uHwrHudAO0D5jhVYQfRwem-zX3QibrsxEyxSELM",
+  "q": "9Yx0zzrhSxdE8ubryZfOyOw6cSbUdyCMgY3IFmEdb_UDZOQNMDCFj2RS1g6yFGKuaFqnL9ZRnmprikf20w-mu-LtLU_l0eK4U7pbAoB--pxFP_O6Yk3ZBu_YJ3FpimyX1v4OVZT-JOU_caKiTrPnlw3P7KbEc9iu_bOc8dE-_e8",
+  "dp": "GwiFbXDS44B58vS4QDtvcCm5Zvnm4bi-SRTNbRJ3Rug5Vagi5Hn6LhsfMKvaHHvAvhxf4CtaFiIbFos28HQJC1he1T12xEct1DWIsxstw3bapu6IhesMoVoVwZ-IxIHkeALy3oG7HmWCyjSbGJIgEoX1lVBtMjkf4_lAyM4dnmc",
+  "dq": "XYtXyMbOo3PG8Z6lfxRVU9gi346CbKu6u3RPIK94rnkyBNKYb55ck2cN47yPfRKnDNxUSvYj--zg8To_PuL8iyGFZ7jDffUYcdVR7J8VQNYdz6JDhEXSA0GGIGilY3XBVsdMoK_1Lgsj41-o48DH3pUFfEuAFf4blE1D4h_sFoM",
+  "qi": "CN3q5TMZO06DlK4onrJ687bPp2GE-fynd7ADPdf1ek3cXbeaFApVNp4w-i8zr7IVugQohn01i_jnkymw4UN-acoIzX2sGYhgDm6le1jyfv28bQ_Z5hT0rFNlPfGyK0kkPYUTxZ4ZCKpCYJT9C1nH58Yu4xFk4VR1zhULegjCCd4",
+  "x5c": [
+    "MIIDfDCCAmSgAwIBAgIJANWAkzF7PA8/MA0GCSqGSIb3DQEBCwUAMFUxCzAJBgNVBAYTAlVTMQswCQYDVQQIEwJDQTEQMA4GA1UEChMHY2VydGlnbzEQMA4GA1UECxMHZXhhbXBsZTEVMBMGA1UEAxMMZXhhbXBsZS1sZWFmMB4XDTE2MDYxMDIyMTQxMVoXDTIzMDQxNTIyMTQxMVowVTELMAkGA1UEBhMCVVMxCzAJBgNVBAgTAkNBMRAwDgYDVQQKEwdjZXJ0aWdvMRAwDgYDVQQLEwdleGFtcGxlMRUwEwYDVQQDEwxleGFtcGxlLWxlYWYwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQC7stSvfQyGuHw3v34fisqIdDXberrFoFk9ht/WdXgYzX2uLNKdsR/J5sbWSl8K/5djpzj31eIzqU69w8v7SChM5x9bouDsABHz3kZucx5cSafEgJojysBkcrq3VY+aJanzbL+qErYX+lhRpPcZK6JMWIwar8Y3B2la4yWwieecw2/WfEVvG0M/DOYKnR8QHFsfl3US1dnBM84czKPyt9r40gDk2XiH/lGts5a94rAGvbr8IMCtq0mA5aH3Fx3mDSi3+4MZwygCAHrF5O5iSV9rEI+m2+7j2S+jHDUnvV+nqcpb9m6ENECnYX8FD2KcqlOjTmw8smDy09N2Np6i464lAgMBAAGjTzBNMB0GA1UdJQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDATAsBgNVHREEJTAjhwR/AAABhxAAAAAAAAAAAAAAAAAAAAABgglsb2NhbGhvc3QwDQYJKoZIhvcNAQELBQADggEBAGM4aa/qrURUweZBIwZYv8O9b2+r4l0HjGAh982/B9sMlM05kojyDCUGvj86z18Lm8mKr4/y+i0nJ+vDIksEvfDuzw5ALAXGcBzPJKtICUf7LstA/n9NNpshWz0kld9ylnB5mbUzSFDncVyeXkEf5sGQXdIIZT9ChRBoiloSaa7dvBVCcsX1LGP2LWqKtD+7nUnw5qCwtyAVT8pthEUxFTpywoiJS5ZdzeEx8MNGvUeLFj2kleqPF78EioEQlSOxViCuctEtnQuPcDLHNFr10byTZY9roObiqdsJLMVvb2XliJjAqaPa9AkYwGE6xHw2ispwg64Rse0+AtKups19WIU="
+  ],
+  "x5t": "BhJU_fcg8sDkvT8zOaL-U1ChXeX",
+  "x5t#S256": "IDJKS5LxImjvmuAl_Vx50Vj_dFdACSGW6DU8ADFRdRX"
+}`)
+
+	var jwk2 JSONWebKey
+	err = jwk2.UnmarshalJSON(mismatchedThumbprints)
+	if err == nil {
+		t.Error("should not unmarshal JWK with mismatched thumbprints")
 	}
-	if !bytes.Equal(jsonbar, jsonbar2) {
-		t.Error("roundtrip should not lose information")
+
+	err = jwk2.UnmarshalJSON(shortThumbprints)
+	if err == nil {
+		t.Error("should not unmarshal JWK with too short thumbprints")
+	}
+}
+
+func TestKeyMismatchX509(t *testing.T) {
+	x5tSHA1 := sha1.Sum(testCertificates[0].Raw)
+	x5tSHA256 := sha256.Sum256(testCertificates[0].Raw)
+
+	jwk := JSONWebKey{
+		KeyID:                       "bar",
+		Algorithm:                   "foo",
+		Certificates:                testCertificates,
+		CertificateThumbprintSHA1:   x5tSHA1[:],
+		CertificateThumbprintSHA256: x5tSHA256[:],
+	}
+
+	for _, key := range []interface{}{
+		// None of these keys should match what's in the cert, so parsing should always fail.
+		ecTestKey256,
+		ecTestKey256.Public(),
+		ecTestKey384,
+		ecTestKey384.Public(),
+		ecTestKey521,
+		ecTestKey521.Public(),
+		rsaTestKey,
+		rsaTestKey.Public(),
+		ed25519PrivateKey,
+		ed25519PrivateKey.Public(),
+	} {
+		jwk.Key = key
+		raw, _ := jwk.MarshalJSON()
+
+		var jwk2 JSONWebKey
+		err := jwk2.UnmarshalJSON(raw)
+		if err == nil {
+			t.Error("should not unmarshal JWK with key/cert mismatch")
+		}
 	}
 }
 
 func TestMarshalUnmarshal(t *testing.T) {
 	kid := "DEADBEEF"
 
-	for i, key := range []interface{}{ecTestKey256, ecTestKey384, ecTestKey521, rsaTestKey} {
+	for i, key := range []interface{}{
+		ecTestKey256,
+		ecTestKey256.Public(),
+		ecTestKey384,
+		ecTestKey384.Public(),
+		ecTestKey521,
+		ecTestKey521.Public(),
+		rsaTestKey,
+		rsaTestKey.Public(),
+		ed25519PrivateKey,
+		ed25519PrivateKey.Public(),
+	} {
 		for _, use := range []string{"", "sig", "enc"} {
-			jwk := JsonWebKey{Key: key, KeyID: kid, Algorithm: "foo"}
+			jwk := JSONWebKey{Key: key, KeyID: kid, Algorithm: "foo"}
 			if use != "" {
 				jwk.Use = use
 			}
@@ -248,15 +508,15 @@ func TestMarshalUnmarshal(t *testing.T) {
 				t.Error("problem marshaling", i, err)
 			}
 
-			var jwk2 JsonWebKey
+			var jwk2 JSONWebKey
 			err = jwk2.UnmarshalJSON(jsonbar)
 			if err != nil {
-				t.Error("problem unmarshalling", i, err)
+				t.Fatal("problem unmarshalling", i, err)
 			}
 
 			jsonbar2, err := jwk2.MarshalJSON()
 			if err != nil {
-				t.Error("problem marshaling", i, err)
+				t.Fatal("problem marshaling", i, err)
 			}
 
 			if !bytes.Equal(jsonbar, jsonbar2) {
@@ -279,18 +539,18 @@ func TestMarshalUnmarshal(t *testing.T) {
 
 func TestMarshalNonPointer(t *testing.T) {
 	type EmbedsKey struct {
-		Key JsonWebKey
+		Key JSONWebKey
 	}
 
-	keyJson := []byte(`{
+	keyJSON := []byte(`{
 		"e": "AQAB",
 		"kty": "RSA",
 		"n": "vd7rZIoTLEe-z1_8G1FcXSw9CQFEJgV4g9V277sER7yx5Qjz_Pkf2YVth6wwwFJEmzc0hoKY-MMYFNwBE4hQHw"
 	}`)
-	var parsedKey JsonWebKey
-	err := json.Unmarshal(keyJson, &parsedKey)
+	var parsedKey JSONWebKey
+	err := json.Unmarshal(keyJSON, &parsedKey)
 	if err != nil {
-		t.Error(fmt.Sprintf("Error unmarshalling key: %v", err))
+		t.Errorf("Error unmarshalling key: %v", err)
 		return
 	}
 	ek := EmbedsKey{
@@ -298,7 +558,7 @@ func TestMarshalNonPointer(t *testing.T) {
 	}
 	out, err := json.Marshal(ek)
 	if err != nil {
-		t.Error(fmt.Sprintf("Error marshalling JSON: %v", err))
+		t.Errorf("Error marshalling JSON: %v", err)
 		return
 	}
 	expected := "{\"Key\":{\"kty\":\"RSA\",\"n\":\"vd7rZIoTLEe-z1_8G1FcXSw9CQFEJgV4g9V277sER7yx5Qjz_Pkf2YVth6wwwFJEmzc0hoKY-MMYFNwBE4hQHw\",\"e\":\"AQAB\"}}"
@@ -349,7 +609,7 @@ func TestMarshalUnmarshalInvalid(t *testing.T) {
 	}
 
 	for i, key := range keys {
-		jwk := JsonWebKey{Key: key}
+		jwk := JSONWebKey{Key: key}
 		_, err := jwk.MarshalJSON()
 		if err == nil {
 			t.Error("managed to serialize invalid key", i)
@@ -377,7 +637,7 @@ func TestWebKeyVectorsInvalid(t *testing.T) {
 	}
 
 	for _, key := range keys {
-		var jwk2 JsonWebKey
+		var jwk2 JSONWebKey
 		err := jwk2.UnmarshalJSON([]byte(key))
 		if err == nil {
 			t.Error("managed to parse invalid key:", key)
@@ -397,6 +657,14 @@ var cookbookJWKs = []string{
          A5RkTKqjqvjyekWF-7ytDyRXYgCF5cj0Kt",
      "y": "AdymlHvOiLxXkEhayXQnNCvDX4h9htZaCJN34kfmC6pV5OhQHiraVy
          SsUdaQkAgDPrwQrJmbnX9cwlGfP-HqHZR1"
+   }`),
+
+	//ED Private
+	stripWhitespace(`{
+     "kty": "OKP",
+     "crv": "Ed25519",
+     "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+     "d": "nWGxne_9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A"
    }`),
 
 	// EC Private
@@ -497,6 +765,7 @@ var cookbookJWKs = []string{
 // SHA-256 thumbprints of the above keys, hex-encoded
 var cookbookJWKThumbprints = []string{
 	"747ae2dd2003664aeeb21e4753fe7402846170a16bc8df8f23a8cf06d3cbe793",
+	"f6934029a341ddf81dceb753e91d17efe16664f40d9f4ed84bc5ea87e111f29d",
 	"747ae2dd2003664aeeb21e4753fe7402846170a16bc8df8f23a8cf06d3cbe793",
 	"f63838e96077ad1fc01c3f8405774dedc0641f558ebb4b40dccf5f9b6d66a932",
 	"0fc478f8579325fcee0d4cbc6d9d1ce21730a6e97e435d6008fb379b0ebe47d4",
@@ -505,7 +774,7 @@ var cookbookJWKThumbprints = []string{
 
 func TestWebKeyVectorsValid(t *testing.T) {
 	for _, key := range cookbookJWKs {
-		var jwk2 JsonWebKey
+		var jwk2 JSONWebKey
 		err := jwk2.UnmarshalJSON([]byte(key))
 		if err != nil {
 			t.Error("unable to parse valid key:", key, err)
@@ -513,9 +782,25 @@ func TestWebKeyVectorsValid(t *testing.T) {
 	}
 }
 
+func TestEd25519Serialization(t *testing.T) {
+	jwk := JSONWebKey{
+		Key: ed25519PrivateKey,
+	}
+	serialized, _ := json.Marshal(jwk)
+
+	var jwk2 JSONWebKey
+	if err := json.Unmarshal(serialized, &jwk2); err != nil {
+		t.Fatal(err)
+	}
+
+	assert.True(t, bytes.Equal(
+		[]byte(jwk.Key.(ed25519.PrivateKey).Public().(ed25519.PublicKey)),
+		[]byte(jwk2.Key.(ed25519.PrivateKey).Public().(ed25519.PublicKey))))
+}
+
 func TestThumbprint(t *testing.T) {
 	for i, key := range cookbookJWKs {
-		var jwk2 JsonWebKey
+		var jwk2 JSONWebKey
 		err := jwk2.UnmarshalJSON([]byte(key))
 		if err != nil {
 			t.Error("unable to parse valid key:", key, err)
@@ -534,9 +819,9 @@ func TestThumbprint(t *testing.T) {
 }
 
 func TestMarshalUnmarshalJWKSet(t *testing.T) {
-	jwk1 := JsonWebKey{Key: rsaTestKey, KeyID: "ABCDEFG", Algorithm: "foo"}
-	jwk2 := JsonWebKey{Key: rsaTestKey, KeyID: "GFEDCBA", Algorithm: "foo"}
-	var set JsonWebKeySet
+	jwk1 := JSONWebKey{Key: rsaTestKey, KeyID: "ABCDEFG", Algorithm: "foo"}
+	jwk2 := JSONWebKey{Key: rsaTestKey, KeyID: "GFEDCBA", Algorithm: "foo"}
+	var set JSONWebKeySet
 	set.Keys = append(set.Keys, jwk1)
 	set.Keys = append(set.Keys, jwk2)
 
@@ -544,14 +829,14 @@ func TestMarshalUnmarshalJWKSet(t *testing.T) {
 	if err != nil {
 		t.Error("problem marshalling set", err)
 	}
-	var set2 JsonWebKeySet
+	var set2 JSONWebKeySet
 	err = json.Unmarshal(jsonbar, &set2)
 	if err != nil {
-		t.Error("problem unmarshalling set", err)
+		t.Fatal("problem unmarshalling set", err)
 	}
 	jsonbar2, err := json.Marshal(&set2)
 	if err != nil {
-		t.Error("problem marshalling set", err)
+		t.Fatal("problem marshalling set", err)
 	}
 	if !bytes.Equal(jsonbar, jsonbar2) {
 		t.Error("roundtrip should not lose information")
@@ -559,9 +844,9 @@ func TestMarshalUnmarshalJWKSet(t *testing.T) {
 }
 
 func TestJWKSetKey(t *testing.T) {
-	jwk1 := JsonWebKey{Key: rsaTestKey, KeyID: "ABCDEFG", Algorithm: "foo"}
-	jwk2 := JsonWebKey{Key: rsaTestKey, KeyID: "GFEDCBA", Algorithm: "foo"}
-	var set JsonWebKeySet
+	jwk1 := JSONWebKey{Key: rsaTestKey, KeyID: "ABCDEFG", Algorithm: "foo"}
+	jwk2 := JSONWebKey{Key: rsaTestKey, KeyID: "GFEDCBA", Algorithm: "foo"}
+	var set JSONWebKeySet
 	set.Keys = append(set.Keys, jwk1)
 	set.Keys = append(set.Keys, jwk2)
 	k := set.Key("ABCDEFG")
@@ -577,8 +862,10 @@ func TestJWKSymmetricKey(t *testing.T) {
 	sample1 := `{"kty":"oct","alg":"A128KW","k":"GawgguFyGrWKav7AX4VKUg"}`
 	sample2 := `{"kty":"oct","k":"AyM1SysPpbyDfgZld3umj1qzKObwVMkoqQ-EstJQLr_T-1qS0gZH75aKtMN3Yj0iPS4hcgUuTwjAzZr1Z9CAow","kid":"HMAC key used in JWS spec Appendix A.1 example"}`
 
-	var jwk1 JsonWebKey
-	json.Unmarshal([]byte(sample1), &jwk1)
+	var jwk1 JSONWebKey
+	if err := json.Unmarshal([]byte(sample1), &jwk1); err != nil {
+		t.Fatal(err)
+	}
 
 	if jwk1.Algorithm != "A128KW" {
 		t.Errorf("expected Algorithm to be A128KW, but was '%s'", jwk1.Algorithm)
@@ -588,8 +875,10 @@ func TestJWKSymmetricKey(t *testing.T) {
 		t.Errorf("expected Key to be '%s', but was '%s'", hex.EncodeToString(expected1), hex.EncodeToString(jwk1.Key.([]byte)))
 	}
 
-	var jwk2 JsonWebKey
-	json.Unmarshal([]byte(sample2), &jwk2)
+	var jwk2 JSONWebKey
+	if err := json.Unmarshal([]byte(sample2), &jwk2); err != nil {
+		t.Fatal(err)
+	}
 
 	if jwk2.KeyID != "HMAC key used in JWS spec Appendix A.1 example" {
 		t.Errorf("expected KeyID to be 'HMAC key used in JWS spec Appendix A.1 example', but was '%s'", jwk2.KeyID)
@@ -603,16 +892,16 @@ func TestJWKSymmetricKey(t *testing.T) {
 }
 
 func TestJWKSymmetricRoundtrip(t *testing.T) {
-	jwk1 := JsonWebKey{Key: []byte{1, 2, 3, 4}}
+	jwk1 := JSONWebKey{Key: []byte{1, 2, 3, 4}}
 	marshaled, err := jwk1.MarshalJSON()
 	if err != nil {
-		t.Errorf("failed to marshal valid JWK object", err)
+		t.Error("failed to marshal valid JWK object", err)
 	}
 
-	var jwk2 JsonWebKey
+	var jwk2 JSONWebKey
 	err = jwk2.UnmarshalJSON(marshaled)
 	if err != nil {
-		t.Errorf("failed to unmarshal valid JWK object", err)
+		t.Error("failed to unmarshal valid JWK object", err)
 	}
 
 	if !bytes.Equal(jwk1.Key.([]byte), jwk2.Key.([]byte)) {
@@ -621,23 +910,51 @@ func TestJWKSymmetricRoundtrip(t *testing.T) {
 }
 
 func TestJWKSymmetricInvalid(t *testing.T) {
-	invalid := JsonWebKey{}
+	invalid := JSONWebKey{}
 	_, err := invalid.MarshalJSON()
 	if err == nil {
 		t.Error("excepted error on marshaling invalid symmetric JWK object")
 	}
 
-	var jwk JsonWebKey
+	var jwk JSONWebKey
 	err = jwk.UnmarshalJSON([]byte(`{"kty":"oct"}`))
 	if err == nil {
 		t.Error("excepted error on unmarshaling invalid symmetric JWK object")
 	}
 }
 
+func TestJWKIsPublic(t *testing.T) {
+	bigInt := big.NewInt(0)
+	eccPub := ecdsa.PublicKey{Curve: elliptic.P256(), X: bigInt, Y: bigInt}
+	rsaPub := rsa.PublicKey{N: bigInt, E: 1}
+
+	cases := []struct {
+		key              interface{}
+		expectedIsPublic bool
+	}{
+		{&eccPub, true},
+		{&ecdsa.PrivateKey{PublicKey: eccPub, D: bigInt}, false},
+		{&rsaPub, true},
+		{&rsa.PrivateKey{PublicKey: rsaPub, D: bigInt, Primes: []*big.Int{bigInt, bigInt}}, false},
+		{ed25519PublicKey, true},
+		{ed25519PrivateKey, false},
+	}
+
+	for _, tc := range cases {
+		k := &JSONWebKey{Key: tc.key}
+		if public := k.IsPublic(); public != tc.expectedIsPublic {
+			t.Errorf("expected IsPublic to return %t, got %t", tc.expectedIsPublic, public)
+		}
+	}
+}
+
 func TestJWKValid(t *testing.T) {
 	bigInt := big.NewInt(0)
-	eccPub := ecdsa.PublicKey{elliptic.P256(), bigInt, bigInt}
-	rsaPub := rsa.PublicKey{bigInt, 1}
+	eccPub := ecdsa.PublicKey{Curve: elliptic.P256(), X: bigInt, Y: bigInt}
+	rsaPub := rsa.PublicKey{N: bigInt, E: 1}
+	edPubEmpty := ed25519.PublicKey([]byte{})
+	edPrivEmpty := ed25519.PublicKey([]byte{})
+
 	cases := []struct {
 		key              interface{}
 		expectedValidity bool
@@ -646,17 +963,151 @@ func TestJWKValid(t *testing.T) {
 		{&ecdsa.PublicKey{}, false},
 		{&eccPub, true},
 		{&ecdsa.PrivateKey{}, false},
-		{&ecdsa.PrivateKey{eccPub, bigInt}, true},
+		{&ecdsa.PrivateKey{PublicKey: eccPub, D: bigInt}, true},
 		{&rsa.PublicKey{}, false},
 		{&rsaPub, true},
 		{&rsa.PrivateKey{}, false},
-		{&rsa.PrivateKey{rsaPub, bigInt, []*big.Int{bigInt, bigInt}, rsa.PrecomputedValues{}}, true},
+		{&rsa.PrivateKey{PublicKey: rsaPub, D: bigInt, Primes: []*big.Int{bigInt, bigInt}}, true},
+		{ed25519PublicKey, true},
+		{ed25519PrivateKey, true},
+		{edPubEmpty, false},
+		{edPrivEmpty, false},
 	}
 
 	for _, tc := range cases {
-		k := &JsonWebKey{Key: tc.key}
-		if valid := k.Valid(); valid != tc.expectedValidity {
+		k := &JSONWebKey{Key: tc.key}
+		valid := k.Valid()
+		if valid != tc.expectedValidity {
 			t.Errorf("expected Valid to return %t, got %t", tc.expectedValidity, valid)
 		}
+		if valid {
+			wasPublic := k.IsPublic()
+			p := k.Public() // all aforemention keys are asymmetric
+			if !p.Valid() {
+				t.Errorf("unable to derive public key from valid asymmetric key")
+			}
+			if wasPublic != k.IsPublic() {
+				t.Errorf("original key was touched during public key derivation")
+			}
+		}
+	}
+}
+
+func TestJWKBufferSizeCheck(t *testing.T) {
+	key := `{
+		"kty":"EC",
+		"crv":"P-256",
+		"x":"m9GSmJ5iGmAYlMlaOJGSFN_CjN9cIn8GGYExP-C0FBiIXlWTNvGN38R9WdrHcppfsKF0FXMOMyutpHIRaiMxYSA",
+		"y":"ZaPcRZ3q_7T3h-Gwz2i-T2JjJXfj6YVGgKHcFz5zqmg"}`
+	var jwk JSONWebKey
+	if err := jwk.UnmarshalJSON([]byte(key)); err == nil {
+		t.Fatal("key should be invalid")
+	}
+	jwk.Valid() // true
+	// panic: square/go-jose: invalid call to newFixedSizeBuffer (len(data) > length)
+	// github.com/square/go-jose.newFixedSizeBuffer(0xc420014557, 0x41, 0x41, 0x20, 0x0)
+	jwk.Thumbprint(crypto.SHA256)
+}
+
+func TestJWKPaddingPrivateX(t *testing.T) {
+	key := `{
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "nPTIABcDASY6FNGSNfHCB51tY7qChtgzeVazOtLrwQ",
+    "y": "vEEs4V0egJkNyM2Q4pp001zu14VcpQ0_Ei8xOOPxKZs",
+    "d": "nIVCvMR2wkLmeGJErOpI23VDHl2s3JwGdbzKy0odir0"
+  }`
+	var jwk JSONWebKey
+	err := jwk.UnmarshalJSON([]byte(key))
+	if err == nil {
+		t.Errorf("Expected key with short x to fail unmarshalling")
+	}
+	if !strings.Contains(err.Error(), "wrong length for x") {
+		t.Errorf("Wrong error for short x, got %q", err)
+	}
+	if jwk.Valid() {
+		t.Errorf("Expected key to be invalid, but it was valid.")
+	}
+}
+
+func TestJWKPaddingPrivateY(t *testing.T) {
+	key := `{
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "vEEs4V0egJkNyM2Q4pp001zu14VcpQ0_Ei8xOOPxKZs",
+    "y": "nPTIABcDASY6FNGSNfHCB51tY7qChtgzeVazOtLrwQ",
+    "d": "nIVCvMR2wkLmeGJErOpI23VDHl2s3JwGdbzKy0odir0"
+  }`
+	var jwk JSONWebKey
+	err := jwk.UnmarshalJSON([]byte(key))
+	if err == nil {
+		t.Errorf("Expected key with short x to fail unmarshalling")
+	}
+	if !strings.Contains(err.Error(), "wrong length for y") {
+		t.Errorf("Wrong error for short y, got %q", err)
+	}
+	if jwk.Valid() {
+		t.Errorf("Expected key to be invalid, but it was valid.")
+	}
+}
+
+func TestJWKPaddingPrivateD(t *testing.T) {
+	key := `{
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "vEEs4V0egJkNyM2Q4pp001zu14VcpQ0_Ei8xOOPxKZs",
+    "y": "qnPTIABcDASY6FNGSNfHCB51tY7qChtgzeVazOtLrwQ",
+    "d": "IVCvMR2wkLmeGJErOpI23VDHl2s3JwGdbzKy0odir0"
+  }`
+	var jwk JSONWebKey
+	err := jwk.UnmarshalJSON([]byte(key))
+	if err == nil {
+		t.Errorf("Expected key with short x to fail unmarshalling")
+	}
+	if !strings.Contains(err.Error(), "wrong length for d") {
+		t.Errorf("Wrong error for short d, got %q", err)
+	}
+	if jwk.Valid() {
+		t.Errorf("Expected key to be invalid, but it was valid.")
+	}
+}
+
+func TestJWKPaddingX(t *testing.T) {
+	key := `{
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "nPTIABcDASY6FNGSNfHCB51tY7qChtgzeVazOtLrwQ",
+    "y": "vEEs4V0egJkNyM2Q4pp001zu14VcpQ0_Ei8xOOPxKZs"
+  }`
+	var jwk JSONWebKey
+	err := jwk.UnmarshalJSON([]byte(key))
+	if err == nil {
+		t.Errorf("Expected key with short x to fail unmarshalling")
+	}
+	if !strings.Contains(err.Error(), "wrong length for x") {
+		t.Errorf("Wrong error for short x, got %q", err)
+	}
+	if jwk.Valid() {
+		t.Errorf("Expected key to be invalid, but it was valid.")
+	}
+}
+
+func TestJWKPaddingY(t *testing.T) {
+	key := `{
+    "kty": "EC",
+    "crv": "P-256",
+    "x": "vEEs4V0egJkNyM2Q4pp001zu14VcpQ0_Ei8xOOPxKZs",
+    "y": "nPTIABcDASY6FNGSNfHCB51tY7qChtgzeVazOtLrwQ"
+  }`
+	var jwk JSONWebKey
+	err := jwk.UnmarshalJSON([]byte(key))
+	if err == nil {
+		t.Errorf("Expected key with short y to fail unmarshalling")
+	}
+	if !strings.Contains(err.Error(), "wrong length for y") {
+		t.Errorf("Wrong error for short y, got %q", err)
+	}
+	if jwk.Valid() {
+		t.Errorf("Expected key to be invalid, but it was valid.")
 	}
 }

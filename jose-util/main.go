@@ -1,5 +1,5 @@
 /*-
- * Copyright 2014 Square Inc.
+ * Copyright 2019 Square Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,173 +17,94 @@
 package main
 
 import (
+	"bufio"
+	"encoding/base64"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"os"
 
-	"github.com/square/go-jose"
-	"gopkg.in/alecthomas/kingpin.v2"
+	kingpin "gopkg.in/alecthomas/kingpin.v2"
+
+	jose "github.com/square/go-jose/v3"
+	generator "github.com/square/go-jose/jose-util/generator"
 )
 
 var (
-	app = kingpin.New("jose-util", "A command-line utility for dealing with JOSE objects.")
+	app = kingpin.New("jose-util", "A command-line utility for dealing with JOSE objects")
 
-	keyFile = app.Flag("key", "Path to key file (PEM or DER-encoded)").ExistingFile()
-	inFile  = app.Flag("in", "Path to input file (stdin if missing)").ExistingFile()
-	outFile = app.Flag("out", "Path to output file (stdout if missing)").ExistingFile()
+	// Util-wide flags
+	keyFile = app.Flag("key", "Path to key file (if applicable, PEM, DER or JWK format)").ExistingFile()
+	inFile  = app.Flag("in", "Path to input file (if applicable, stdin if missing)").ExistingFile()
+	outFile = app.Flag("out", "Path to output file (if applicable, stdout if missing)").ExistingFile()
 
-	encryptCommand = app.Command("encrypt", "Encrypt a plaintext, output ciphertext.")
-	algFlag        = encryptCommand.Flag("alg", "Key management algorithm (e.g. RSA-OAEP)").Required().String()
-	encFlag        = encryptCommand.Flag("enc", "Content encryption algorithm (e.g. A128GCM)").Required().String()
+	// Encrypt
+	encryptCommand  = app.Command("encrypt", "Encrypt a plaintext, output ciphertext")
+	encryptAlgFlag  = encryptCommand.Flag("alg", "Key management algorithm (e.g. RSA-OAEP)").Required().String()
+	encryptEncFlag  = encryptCommand.Flag("enc", "Content encryption algorithm (e.g. A128GCM)").Required().String()
+	encryptFullFlag = encryptCommand.Flag("full", "Use JSON Serialization format (instead of compact)").Bool()
 
-	decryptCommand = app.Command("decrypt", "Decrypt a ciphertext, output plaintext.")
+	// Decrypt
+	decryptCommand = app.Command("decrypt", "Decrypt a ciphertext, output plaintext")
 
-	signCommand = app.Command("sign", "Sign a payload, output signed message.")
-	sigAlgFlag  = signCommand.Flag("alg", "Key management algorithm (e.g. RSA-OAEP)").Required().String()
+	// Sign
+	signCommand  = app.Command("sign", "Sign a payload, output signed message")
+	signAlgFlag  = signCommand.Flag("alg", "Key management algorithm (e.g. RSA-OAEP)").Required().String()
+	signFullFlag = signCommand.Flag("full", "Use JSON Serialization format (instead of compact)").Bool()
 
-	verifyCommand = app.Command("verify", "Verify a signed message, output payload.")
+	// Verify
+	verifyCommand = app.Command("verify", "Verify a signed message, output payload")
 
-	expandCommand = app.Command("expand", "Expand JOSE object to full serialization format.")
-	formatFlag    = expandCommand.Flag("format", "Type of message to expand (JWS or JWE, defaults to JWE)").String()
+	// Expand
+	expandCommand    = app.Command("expand", "Expand JOSE object to JSON Serialization format")
+	expandFormatFlag = expandCommand.Flag("format", "Type of message to expand (JWS or JWE, defaults to JWE)").String()
 
-	full = app.Flag("full", "Use full serialization format (instead of compact)").Bool()
+	// Base64-decode
+	base64DecodeCommand = app.Command("b64decode", "Decode a base64-encoded payload (auto-selects standard/url-safe)")
+
+	// Generate key
+	generateCommand = app.Command("generate-key", "Generate a public/private key pair in JWK format")
+	generateUseFlag = generateCommand.Flag("use", "Desired public key usage (use header), one of [enc sig]").Required().Enum("enc", "sig")
+	generateAlgFlag = generateCommand.Flag("alg", "Desired key pair algorithm (alg header)").Required().Enum(
+		// For signing
+		string(jose.EdDSA),
+		string(jose.ES256), string(jose.ES384), string(jose.ES512),
+		string(jose.RS256), string(jose.RS384), string(jose.RS512),
+		string(jose.PS256), string(jose.PS384), string(jose.PS512),
+		// For encryption
+		string(jose.RSA1_5), string(jose.RSA_OAEP), string(jose.RSA_OAEP_256),
+		string(jose.ECDH_ES), string(jose.ECDH_ES_A128KW), string(jose.ECDH_ES_A192KW), string(jose.ECDH_ES_A256KW),
+	)
+	generateKeySizeFlag  = generateCommand.Flag("size", "Key size in bits (e.g. 2048 if generating an RSA key)").Int()
+	generateKeyIdentFlag = generateCommand.Flag("kid", "Optional Key ID (kid header, generate random kid if not set)").String()
 )
 
 func main() {
-	app.Version("master")
+	app.Version("v3")
+	app.UsageTemplate(kingpin.LongHelpTemplate)
 
 	command := kingpin.MustParse(app.Parse(os.Args[1:]))
 
-	var keyBytes []byte
-	var err error
-	if command != "expand" {
-		keyBytes, err = ioutil.ReadFile(*keyFile)
-		exitOnError(err, "unable to read key file")
-	}
-
 	switch command {
-	case "encrypt":
-		pub, err := jose.LoadPublicKey(keyBytes)
-		exitOnError(err, "unable to read public key")
-
-		alg := jose.KeyAlgorithm(*algFlag)
-		enc := jose.ContentEncryption(*encFlag)
-
-		crypter, err := jose.NewEncrypter(alg, enc, pub)
-		exitOnError(err, "unable to instantiate encrypter")
-
-		obj, err := crypter.Encrypt(readInput(*inFile))
-		exitOnError(err, "unable to encrypt")
-
-		var msg string
-		if *full {
-			msg = obj.FullSerialize()
-		} else {
-			msg, err = obj.CompactSerialize()
-			exitOnError(err, "unable to serialize message")
-		}
-
-		writeOutput(*outFile, []byte(msg))
-	case "decrypt":
-		priv, err := jose.LoadPrivateKey(keyBytes)
-		exitOnError(err, "unable to read private key")
-
-		obj, err := jose.ParseEncrypted(string(readInput(*inFile)))
-		exitOnError(err, "unable to parse message")
-
-		plaintext, err := obj.Decrypt(priv)
-		exitOnError(err, "unable to decrypt message")
-
-		writeOutput(*outFile, plaintext)
-	case "sign":
-		signingKey, err := jose.LoadPrivateKey(keyBytes)
-		exitOnError(err, "unable to read private key")
-
-		alg := jose.SignatureAlgorithm(*sigAlgFlag)
-		signer, err := jose.NewSigner(alg, signingKey)
-		exitOnError(err, "unable to make signer")
-
-		obj, err := signer.Sign(readInput(*inFile))
-		exitOnError(err, "unable to sign")
-
-		var msg string
-		if *full {
-			msg = obj.FullSerialize()
-		} else {
-			msg, err = obj.CompactSerialize()
-			exitOnError(err, "unable to serialize message")
-		}
-
-		writeOutput(*outFile, []byte(msg))
-	case "verify":
-		verificationKey, err := jose.LoadPublicKey(keyBytes)
-		exitOnError(err, "unable to read private key")
-
-		obj, err := jose.ParseSigned(string(readInput(*inFile)))
-		exitOnError(err, "unable to parse message")
-
-		plaintext, err := obj.Verify(verificationKey)
-		exitOnError(err, "invalid signature")
-
-		writeOutput(*outFile, plaintext)
-	case "expand":
-		input := string(readInput(*inFile))
-
-		var serialized string
-		var err error
-		switch *formatFlag {
-		case "", "JWE":
-			var jwe *jose.JsonWebEncryption
-			jwe, err = jose.ParseEncrypted(input)
-			if err == nil {
-				serialized = jwe.FullSerialize()
-			}
-		case "JWS":
-			var jws *jose.JsonWebSignature
-			jws, err = jose.ParseSigned(input)
-			if err == nil {
-				serialized = jws.FullSerialize()
-			}
-		}
-
-		exitOnError(err, "unable to expand message")
-		writeOutput(*outFile, []byte(serialized))
-		writeOutput(*outFile, []byte("\n"))
-	}
-}
-
-// Exit and print error message if we encountered a problem
-func exitOnError(err error, msg string) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %s\n", msg, err)
+	case encryptCommand.FullCommand():
+		encrypt()
+	case decryptCommand.FullCommand():
+		decrypt()
+	case signCommand.FullCommand():
+		sign()
+	case verifyCommand.FullCommand():
+		verify()
+	case expandCommand.FullCommand():
+		expand()
+	case generateCommand.FullCommand():
+		generate()
+	case base64DecodeCommand.FullCommand():
+		in := inputStream(*inFile)
+		out := outputStream(*outFile)
+		io.Copy(out, base64.NewDecoder(base64.RawStdEncoding, generator.Base64Reader{In: bufio.NewReader(in)}))
+		defer in.Close()
+		defer out.Close()
+	default:
+		fmt.Fprintf(os.Stderr, "invalid command: %s\n", command)
 		os.Exit(1)
 	}
-}
-
-// Read input from file or stdin
-func readInput(path string) []byte {
-	var bytes []byte
-	var err error
-
-	if path != "" {
-		bytes, err = ioutil.ReadFile(path)
-	} else {
-		bytes, err = ioutil.ReadAll(os.Stdin)
-	}
-
-	exitOnError(err, "unable to read input")
-	return bytes
-}
-
-// Write output to file or stdin
-func writeOutput(path string, data []byte) {
-	var err error
-
-	if path != "" {
-		err = ioutil.WriteFile(path, data, 0644)
-	} else {
-		_, err = os.Stdout.Write(data)
-	}
-
-	exitOnError(err, "unable to write output")
 }
